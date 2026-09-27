@@ -8,7 +8,8 @@ mingw_bin="${MINGW_PREFIX:?Run under an MSYS2 MinGW shell}/bin"
 rm -rf "$out"
 mkdir -p "$out"
 
-make -C "$root" CC=gcc OUT=ccleste-game.exe
+make -C "$root" CC=gcc OUT=ccleste-game.exe \
+    LDFLAGS="$(sdl2-config --libs) -lSDL2_mixer -lm"
 cp "$root/ccleste-game.exe" "$out/ccleste-game.exe"
 gcc -O2 -municode "$root/scripts/launch-windows.c" -o "$out/ccleste.exe"
 cp -R "$root/data" "$out/data"
