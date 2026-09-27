@@ -1,5 +1,7 @@
 #ifndef CELESTE_H_
 #define CELESTE_H_
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 #define _Bool bool
@@ -23,6 +25,13 @@ extern void Celeste_P8_update(void);
 extern void Celeste_P8_draw(void);
 
 extern void Celeste_P8__DEBUG(void); //debug functionality
+
+// Read-only host telemetry. The game still owns movement, rooms, and drawing.
+typedef struct {
+	uint64_t jumps, dashes, climb_pixels, completions;
+	int room, deaths, is_title;
+} Celeste_P8_Telemetry;
+void Celeste_P8_get_telemetry(Celeste_P8_Telemetry* out);
 
 //state functionality
 size_t Celeste_P8_get_state_size(void);

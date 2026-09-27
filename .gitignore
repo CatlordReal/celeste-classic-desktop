@@ -1,5 +1,6 @@
 *.d
 ccleste
+ccleste-game.exe
 ccleste-fixedp
 a.out
 *.o
@@ -11,5 +12,7 @@ build/
 win-build/
 em-build/
 ccleste-win.zip
+dist/
+*.dSYM/
 ccleste-input-cfg.txt
 ccleste-start-fullscreen.txt

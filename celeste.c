@@ -309,6 +309,8 @@ static short minutes; //this variable can overflow in normal gameplay (after +50
 static int deaths, max_djump;
 static bool start_game;
 static int start_game_flash;
+static uint64_t host_jumps, host_dashes, host_completions;
+static uint64_t host_climb_units; // 1/1024 pixel per unit
 
 enum {
   k_left  = 0,
@@ -369,6 +371,8 @@ void Celeste_P8_init() { //identifiers beginning with underscores are reserved i
 }
 
 static void title_screen() {
+	host_jumps=host_dashes=host_completions=0;
+	host_climb_units=0;
 	for (int i = 0; i <= 29; i++)
 		got_fruit[i] = false;
 	frames=0;
@@ -793,6 +797,7 @@ static void PLAYER_update(OBJ* this) {
 				this->jbuffer=0;
 				this->grace=0;
 				this->spd.y=-2;
+				host_jumps++;
 				init_object(OBJ_SMOKE,this->x,this->y+4);
 			} else {
 				// wall jump
@@ -802,6 +807,7 @@ static void PLAYER_update(OBJ* this) {
 					this->jbuffer=0;
 					this->spd.y=-2;
 					this->spd.x=-wall_dir*(maxrun+1);
+					host_jumps++;
 					if (!OBJ_is_ice(this, wall_dir*3,0)) {
 						init_object(OBJ_SMOKE,this->x+wall_dir*6,this->y);
 					}
@@ -816,6 +822,7 @@ static void PLAYER_update(OBJ* this) {
 		if (this->djump>0 && dash) {
 			init_object(OBJ_SMOKE,this->x,this->y);
 			this->djump-=1;
+			host_dashes++;
 			this->dash_time=4;
 			has_dashed=true;
 			this->dash_effect_time=10;
@@ -1492,6 +1499,7 @@ static void FLAG_draw(OBJ* this) {
 		P8sfx(55);
 		sfx_timer=30;
 		this->show=true;
+		if (level_index()==30) host_completions++;
 	}
 }
 
@@ -1728,7 +1736,10 @@ void Celeste_P8_update() {
 		redo_update_slot:
 		if (!obj->active) continue;
 
+		float old_player_y = obj->y;
 		OBJ_move(obj, obj->spd.x,obj->spd.y);
+		if (obj->type == OBJ_PLAYER && obj->y < old_player_y)
+			host_climb_units += (uint64_t)((double)(old_player_y - obj->y) * 1024.0 + 0.5);
 		//printf("update #%i (%s)\n", i, OBJ_PROP(obj).nam);
 		short this_id = obj->id;
 		if (OBJ_PROP(obj).update!=NULL) {
@@ -1997,13 +2008,25 @@ void Celeste_P8__DEBUG(void) {
 	else next_room();
 }
 
+void Celeste_P8_get_telemetry(Celeste_P8_Telemetry* out) {
+	if (!out) return;
+	out->jumps = host_jumps;
+	out->dashes = host_dashes;
+	out->climb_pixels = host_climb_units / 1024;
+	out->completions = host_completions;
+	out->room = level_index();
+	out->deaths = deaths;
+	out->is_title = is_title();
+}
+
 //all of the global game variables; this holds the entire game state (exc. music/sounds playing)
 #define LISTGVARS(V) \
 	V(rnd_seed_lo) V(rnd_seed_hi) \
 	V(room) V(freeze) V(shake) V(will_restart) V(delay_restart) V(got_fruit) \
 	V(has_dashed) V(sfx_timer) V(has_key) V(pause_player) V(flash_bg) V(music_timer) \
 	V(new_bg) V(frames) V(seconds) V(minutes) V(deaths) V(max_djump) V(start_game) \
-	V(start_game_flash) V(clouds) V(particles) V(dead_particles) V(objects)
+	V(start_game_flash) V(host_jumps) V(host_dashes) V(host_completions) \
+	V(host_climb_units) V(clouds) V(particles) V(dead_particles) V(objects)
 
 size_t Celeste_P8_get_state_size(void) {
 #define V_SIZE(v) (sizeof v) +

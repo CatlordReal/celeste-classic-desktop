@@ -10,7 +10,14 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <stdint.h>
 #include <time.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #ifdef _3DS
 #include <3ds.h>
 #endif
@@ -42,6 +49,12 @@ Mix_Music* mus[6] = {NULL};
 
 #define PICO8_W 128
 #define PICO8_H 128
+#if !defined(_3DS) && !defined(EMSCRIPTEN)
+#define HOST_PANEL_W 96
+#else
+#define HOST_PANEL_W 0
+#endif
+#define HOST_W (PICO8_W + HOST_PANEL_W)
 
 #ifdef _3DS
 static const int scale = 2;
@@ -238,6 +251,49 @@ static Mix_Music* game_state_music = NULL;
 static void mainLoop(void);
 static FILE* TAS = NULL;
 
+enum HostMenu {
+	HOST_MENU_NONE,
+	HOST_MENU_MAIN,
+	HOST_MENU_STATS,
+};
+
+typedef struct {
+	uint64_t jumps;
+	uint64_t dashes;
+	uint64_t climb_pixels;
+	uint64_t deaths;
+	uint64_t completions;
+	uint64_t ingame_millis;
+} HostTotals;
+
+static enum HostMenu host_menu = HOST_MENU_NONE;
+static int host_menu_selection = 0;
+static HostTotals host_totals;
+static HostTotals host_run_stats;
+static HostTotals game_state_run_stats;
+static uint64_t host_run_millis = 0;
+static uint64_t game_state_run_millis = 0;
+static _Bool host_run_finished = 0;
+static _Bool game_state_run_finished = 0;
+static _Bool host_has_focus = 1;
+static _Bool host_consume_game_input = 0;
+static Celeste_P8_Telemetry host_previous_telemetry;
+static _Bool host_telemetry_ready = 0;
+static Uint32 host_previous_tick = 0;
+static Uint32 host_last_save_tick = 0;
+static int host_last_room = -1;
+static char host_save_path[4096] = "";
+static char host_save_tmp_path[4096] = "";
+
+static void HostInitPersistence(void);
+static void HostUpdateStats(void);
+static void HostSaveProgress(void);
+static void HostResetRun(void);
+static void HostDrawTimer(void);
+static void HostDrawMenu(void);
+static void HostSetMenu(enum HostMenu menu);
+static void HostActivateMenuSelection(void);
+
 #ifdef _3DS
 // hack: newer SDL versions remove SDL_N3DSKeyBind, but I'm too lazy to change the
 // code to properly use SDL_Joystick inputs on 3DS so work around it ...
@@ -271,6 +327,365 @@ static Uint8 *n3ds_get_fake_key_state(int *numkeys) {
 }
 #endif
 
+#if !defined(_3DS) && !defined(EMSCRIPTEN)
+typedef struct {
+	char magic[8];
+	uint32_t version;
+	uint32_t state_size;
+	uint32_t checksum;
+	int32_t music_index;
+	uint64_t run_millis;
+	uint32_t run_finished;
+	uint32_t reserved;
+	HostTotals run_stats;
+	HostTotals totals;
+} HostSaveHeader;
+
+static uint32_t HostChecksum(const void* data, size_t size, uint32_t hash) {
+	const unsigned char* bytes = data;
+	for (size_t i = 0; i < size; i++) {
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
+static _Bool HostFlushFile(FILE* file) {
+	if (fflush(file) != 0) return 0;
+#ifdef _WIN32
+	return _commit(_fileno(file)) == 0;
+#else
+	return fsync(fileno(file)) == 0;
+#endif
+}
+
+static FILE* HostOpenFile(const char* path, const char* mode) {
+#ifdef _WIN32
+	WCHAR wide_path[4096];
+	WCHAR wide_mode[8];
+	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
+		wide_path, (int)(sizeof wide_path / sizeof *wide_path))) return NULL;
+	if (!MultiByteToWideChar(CP_UTF8, 0, mode, -1,
+		wide_mode, (int)(sizeof wide_mode / sizeof *wide_mode))) return NULL;
+	return _wfopen(wide_path, wide_mode);
+#else
+	return fopen(path, mode);
+#endif
+}
+
+static _Bool HostReplaceFile(const char* source, const char* destination) {
+#ifdef _WIN32
+	WCHAR wide_source[4096];
+	WCHAR wide_destination[4096];
+	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, source, -1,
+		wide_source, (int)(sizeof wide_source / sizeof *wide_source))) return 0;
+	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, destination, -1,
+		wide_destination, (int)(sizeof wide_destination / sizeof *wide_destination))) return 0;
+	return MoveFileExW(wide_source, wide_destination,
+		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+	return rename(source, destination) == 0;
+#endif
+}
+
+static int HostCurrentMusicIndex(void) {
+	for (int i = 0; i < (int)(sizeof mus / sizeof *mus); i++) {
+		if (current_music == mus[i]) return i;
+	}
+	return -1;
+}
+#endif
+
+static void HostFormatDuration(char* output, size_t output_size, uint64_t millis, _Bool centiseconds) {
+	uint64_t hours = millis / 3600000u;
+	unsigned minutes = (unsigned)((millis / 60000u) % 60u);
+	unsigned seconds = (unsigned)((millis / 1000u) % 60u);
+	if (centiseconds) {
+		unsigned hundredths = (unsigned)((millis / 10u) % 100u);
+		snprintf(output, output_size, "%02llu:%02u:%02u.%02u",
+			(unsigned long long)hours, minutes, seconds, hundredths);
+	} else {
+		snprintf(output, output_size, "%lluh %02um %02us",
+			(unsigned long long)hours, minutes, seconds);
+	}
+}
+
+static void HostSetMenu(enum HostMenu menu) {
+	if (menu == HOST_MENU_NONE) {
+		host_menu = menu;
+		paused = 0;
+		if (host_has_focus) {
+			Mix_Resume(-1);
+			Mix_ResumeMusic();
+		}
+		return;
+	}
+	if (host_menu == HOST_MENU_NONE) {
+		Mix_Pause(-1);
+		Mix_PauseMusic();
+	}
+	host_menu = menu;
+	paused = 1;
+}
+
+static void HostResetRun(void) {
+	if (!initial_game_state) return;
+	Celeste_P8_load_state(initial_game_state);
+	Celeste_P8_set_rndseed((unsigned)(time(NULL) + SDL_GetTicks()));
+	Mix_HaltChannel(-1);
+	Mix_HaltMusic();
+	current_music = NULL;
+	Celeste_P8_init();
+	host_run_millis = 0;
+	host_run_finished = 0;
+	memset(&host_run_stats, 0, sizeof host_run_stats);
+	Celeste_P8_get_telemetry(&host_previous_telemetry);
+	host_telemetry_ready = 1;
+	host_last_room = host_previous_telemetry.room;
+	host_previous_tick = SDL_GetTicks();
+	HostSetMenu(HOST_MENU_NONE);
+	HostSaveProgress();
+	OSDset("run reset");
+}
+
+static void HostActivateMenuSelection(void) {
+	if (host_menu == HOST_MENU_NONE) return;
+	if (host_menu == HOST_MENU_STATS) {
+		HostSetMenu(HOST_MENU_MAIN);
+		return;
+	}
+	switch (host_menu_selection) {
+		case 0: HostSetMenu(HOST_MENU_NONE); break;
+		case 1: host_menu = HOST_MENU_STATS; break;
+		case 2: HostResetRun(); break;
+		case 3: HostSaveProgress(); running = 0; break;
+	}
+}
+
+static void HostInitPersistence(void) {
+	host_previous_tick = host_last_save_tick = SDL_GetTicks();
+	Celeste_P8_get_telemetry(&host_previous_telemetry);
+	host_telemetry_ready = 1;
+	host_last_room = host_previous_telemetry.room;
+	if (TAS) return;
+
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	char* preference_path = SDL_GetPrefPath("celeste-classic", "celeste-classic");
+	if (!preference_path) {
+		ErrLog("SDL_GetPrefPath: %s\n", SDL_GetError());
+		return;
+	}
+	snprintf(host_save_path, sizeof host_save_path, "%sprogress.dat", preference_path);
+	snprintf(host_save_tmp_path, sizeof host_save_tmp_path, "%sprogress.tmp", preference_path);
+	SDL_free(preference_path);
+
+	FILE* file = HostOpenFile(host_save_path, "rb");
+	if (!file) return;
+	HostSaveHeader header;
+	memset(&header, 0, sizeof header);
+	_Bool valid = fread(&header, sizeof header, 1, file) == 1;
+	size_t state_size = Celeste_P8_get_state_size();
+	valid = valid && memcmp(header.magic, "CCLSTSV2", 8) == 0;
+	valid = valid && header.version == 2 && header.state_size == state_size;
+	valid = valid && header.run_finished <= 1;
+	valid = valid && header.music_index >= -1 && header.music_index < (int)(sizeof mus / sizeof *mus);
+	valid = valid && header.run_millis <= header.totals.ingame_millis;
+	valid = valid && header.run_stats.jumps <= header.totals.jumps;
+	valid = valid && header.run_stats.dashes <= header.totals.dashes;
+	valid = valid && header.run_stats.climb_pixels <= header.totals.climb_pixels;
+	valid = valid && header.run_stats.deaths <= header.totals.deaths;
+	valid = valid && header.run_stats.completions <= header.totals.completions;
+	void* state = valid ? SDL_malloc(state_size) : NULL;
+	valid = valid && state && fread(state, state_size, 1, file) == 1;
+	valid = valid && fgetc(file) == EOF && !ferror(file);
+	uint32_t expected_checksum = header.checksum;
+	header.checksum = 0;
+	uint32_t checksum = HostChecksum(&header, sizeof header, 2166136261u);
+	if (valid) checksum = HostChecksum(state, state_size, checksum);
+	valid = valid && checksum == expected_checksum;
+	fclose(file);
+
+	if (!valid) {
+		ErrLog("ignored invalid save: %s\n", host_save_path);
+		if (state) SDL_free(state);
+		return;
+	}
+
+	Celeste_P8_load_state(state);
+	SDL_free(state);
+	host_totals = header.totals;
+	host_run_stats = header.run_stats;
+	host_run_millis = header.run_millis;
+	host_run_finished = (_Bool)header.run_finished;
+	Mix_HaltMusic();
+	current_music = NULL;
+	if (header.music_index >= 0 && mus[header.music_index]) {
+		current_music = mus[header.music_index];
+		Mix_PlayMusic(current_music, -1);
+	}
+	Celeste_P8_get_telemetry(&host_previous_telemetry);
+	host_last_room = host_previous_telemetry.room;
+	OSDset("progress loaded");
+#endif
+}
+
+static void HostSaveProgress(void) {
+	if (TAS || !host_telemetry_ready || !host_save_path[0]) return;
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	size_t state_size = Celeste_P8_get_state_size();
+	if (state_size > UINT32_MAX) return;
+	void* state = SDL_malloc(state_size);
+	if (!state) return;
+	Celeste_P8_save_state(state);
+
+	HostSaveHeader header;
+	memset(&header, 0, sizeof header);
+	memcpy(header.magic, "CCLSTSV2", 8);
+	header.version = 2;
+	header.state_size = (uint32_t)state_size;
+	header.music_index = HostCurrentMusicIndex();
+	header.run_millis = host_run_millis;
+	header.run_finished = host_run_finished;
+	header.run_stats = host_run_stats;
+	header.totals = host_totals;
+	header.checksum = HostChecksum(&header, sizeof header, 2166136261u);
+	header.checksum = HostChecksum(state, state_size, header.checksum);
+
+	FILE* file = HostOpenFile(host_save_tmp_path, "wb");
+	_Bool saved = file != NULL;
+	saved = saved && fwrite(&header, sizeof header, 1, file) == 1;
+	saved = saved && fwrite(state, state_size, 1, file) == 1;
+	saved = saved && HostFlushFile(file);
+	if (file && fclose(file) != 0) saved = 0;
+	if (saved) saved = HostReplaceFile(host_save_tmp_path, host_save_path);
+	if (!saved) {
+#ifdef _WIN32
+		ErrLog("couldn't save progress '%s': errno %d, Win32 %lu\n",
+			host_save_path, errno, (unsigned long)GetLastError());
+#else
+		ErrLog("couldn't save progress '%s': %s\n", host_save_path, strerror(errno));
+#endif
+	}
+	SDL_free(state);
+	host_last_save_tick = SDL_GetTicks();
+#endif
+}
+
+static void HostUpdateStats(void) {
+	Celeste_P8_Telemetry telemetry;
+	Celeste_P8_get_telemetry(&telemetry);
+	Uint32 now = SDL_GetTicks();
+	Uint32 elapsed = now - host_previous_tick;
+	host_previous_tick = now;
+	_Bool new_run = host_telemetry_ready && host_previous_telemetry.is_title && !telemetry.is_title;
+	if (new_run) {
+		host_run_millis = 0;
+		host_run_finished = 0;
+		memset(&host_run_stats, 0, sizeof host_run_stats);
+	}
+
+	if (host_telemetry_ready) {
+#define ADD_TELEMETRY_TOTAL(field) \
+		if (telemetry.field >= host_previous_telemetry.field) { \
+			uint64_t delta = telemetry.field - host_previous_telemetry.field; \
+			host_run_stats.field += delta; \
+			host_totals.field += delta; \
+		}
+		ADD_TELEMETRY_TOTAL(jumps);
+		ADD_TELEMETRY_TOTAL(dashes);
+		ADD_TELEMETRY_TOTAL(climb_pixels);
+		ADD_TELEMETRY_TOTAL(completions);
+#undef ADD_TELEMETRY_TOTAL
+		if (telemetry.deaths >= host_previous_telemetry.deaths) {
+			uint64_t delta = (uint64_t)(telemetry.deaths - host_previous_telemetry.deaths);
+			host_run_stats.deaths += delta;
+			host_totals.deaths += delta;
+		}
+	}
+
+	if (!paused && host_has_focus && !telemetry.is_title) {
+		if (!host_run_finished) host_run_millis += elapsed;
+		host_totals.ingame_millis += elapsed;
+	}
+	if (host_telemetry_ready
+	 && telemetry.completions > host_previous_telemetry.completions)
+		host_run_finished = 1;
+	host_previous_telemetry = telemetry;
+	host_telemetry_ready = 1;
+
+	if (!TAS && telemetry.room != host_last_room) {
+		host_last_room = telemetry.room;
+		HostSaveProgress();
+	} else if (!TAS && now - host_last_save_tick >= 10000u) {
+		HostSaveProgress();
+	}
+}
+
+static void HostDrawTimer(void) {
+#if HOST_PANEL_W > 0
+	Celeste_P8_Telemetry telemetry;
+	Celeste_P8_get_telemetry(&telemetry);
+	char time_text[32];
+	HostFormatDuration(time_text, sizeof time_text, host_run_millis, 1);
+	p8_rectfill(PICO8_W, 0, HOST_W - 1, PICO8_H - 1, 0);
+	p8_rectfill(PICO8_W, 0, PICO8_W + 1, PICO8_H - 1, 1);
+	p8_print("speedrun", PICO8_W + 9, 10, 6);
+	p8_print(telemetry.is_title ? "--:--:--.--" : time_text, PICO8_W + 9, 20, 7);
+	if (!telemetry.is_title) {
+		char room_text[24];
+		snprintf(room_text, sizeof room_text, "stage %d", telemetry.room + 1);
+		if (host_run_finished) p8_print("finished", PICO8_W + 9, 33, 11);
+		p8_print(room_text, PICO8_W + 9, 44, 6);
+	}
+	p8_print("esc: menu", PICO8_W + 9, 110, 5);
+#endif
+}
+
+static void HostDrawMenu(void) {
+	if (host_menu == HOST_MENU_NONE) return;
+#if HOST_PANEL_W > 0
+	const int panel_x = PICO8_W + 6;
+	p8_rectfill(PICO8_W, 0, HOST_W - 1, PICO8_H - 1, 0);
+	p8_rectfill(PICO8_W, 0, PICO8_W + 1, PICO8_H - 1, 1);
+
+	if (host_menu == HOST_MENU_MAIN) {
+		static const char* items[] = {"resume", "stats", "reset to start", "save and quit"};
+		p8_print("menu", panel_x, 10, 7);
+		for (int i = 0; i < (int)(sizeof items / sizeof *items); i++) {
+			char line[32];
+			snprintf(line, sizeof line, "%c %s", i == host_menu_selection ? '>' : ' ', items[i]);
+			p8_print(line, panel_x, 31 + i * 14, i == host_menu_selection ? 10 : 6);
+		}
+		if (host_menu_selection == 2) p8_print("keeps all-time stats", panel_x, 95, 5);
+		p8_print("arrows + z/enter", panel_x, 110, 5);
+		return;
+	}
+
+	char line[64], run_time[32], total_time[32];
+	HostFormatDuration(run_time, sizeof run_time, host_run_millis, 0);
+	HostFormatDuration(total_time, sizeof total_time, host_totals.ingame_millis, 0);
+	p8_print("stats", panel_x, 5, 7);
+	p8_print("current / all time", panel_x, 15, 6);
+#define DRAW_STAT(y, label, current, total) do { \
+		snprintf(line, sizeof line, "%s %llu/%llu", label, \
+			(unsigned long long)(current), (unsigned long long)(total)); \
+		p8_print(line, panel_x, y, 7); \
+	} while (0)
+	DRAW_STAT(27, "jumps", host_run_stats.jumps, host_totals.jumps);
+	DRAW_STAT(38, "dashes", host_run_stats.dashes, host_totals.dashes);
+	DRAW_STAT(49, "climbed m", host_run_stats.climb_pixels * 100u / 128u,
+		host_totals.climb_pixels * 100u / 128u);
+	DRAW_STAT(60, "deaths", host_run_stats.deaths, host_totals.deaths);
+	DRAW_STAT(71, "completions", host_run_stats.completions, host_totals.completions);
+#undef DRAW_STAT
+	snprintf(line, sizeof line, "time %s", run_time);
+	p8_print(line, panel_x, 82, 7);
+	snprintf(line, sizeof line, "all  %s", total_time);
+	p8_print(line, panel_x, 93, 7);
+	p8_print("z/enter/esc: back", panel_x, 112, 5);
+#endif
+}
+
 int main(int argc, char** argv) {
 	SDL_CHECK(SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO) == 0);
 #if SDL_MAJOR_VERSION >= 2
@@ -295,7 +710,7 @@ int main(int argc, char** argv) {
 	SDL_N3DSKeyBind(KEY_L, SDLK_d); //load state
 	SDL_N3DSKeyBind(KEY_R, SDLK_s); //save state
 #endif
-	SDL_CHECK(screen = SDL_SetVideoMode(PICO8_W*scale, PICO8_H*scale, 32, videoflag));
+	SDL_CHECK(screen = SDL_SetVideoMode(HOST_W*scale, PICO8_H*scale, 32, videoflag));
 	SDL_WM_SetCaption("Celeste", NULL);
 	int mixflag = MIX_INIT_OGG;
 	if (Mix_Init(mixflag) != mixflag) {
@@ -366,6 +781,7 @@ int main(int argc, char** argv) {
 	}
 
 	Celeste_P8_init();
+	HostInitPersistence();
 
 	printf("ready\n");
 	{
@@ -389,6 +805,7 @@ int main(int argc, char** argv) {
 	return 0;
 #endif
 
+	HostSaveProgress();
 	if (game_state) SDL_free(game_state);
 	if (initial_game_state) SDL_free(initial_game_state);
 
@@ -420,6 +837,7 @@ static void ReadGamepadInput(Uint16* out_buttons);
 
 static void mainLoop(void) {
 	const Uint8* kbstate = SDL_GetKeyState(NULL);
+	_Bool menu_was_open = host_menu != HOST_MENU_NONE;
 		
 	static int reset_input_timer = 0;
 	//hold F9 (select+start+y) to reset
@@ -433,14 +851,7 @@ static void mainLoop(void) {
 		reset_input_timer++;
 		if (reset_input_timer >= 30) {
 			reset_input_timer=0;
-			//reset
-			OSDset("reset");
-			paused = 0;
-			Celeste_P8_load_state(initial_game_state);
-			Celeste_P8_set_rndseed((unsigned)(time(NULL) + SDL_GetTicks()));
-			Mix_HaltChannel(-1);
-			Mix_HaltMusic();
-			Celeste_P8_init();
+			HostResetRun();
 		}
 	} else reset_input_timer = 0;
 
@@ -451,22 +862,42 @@ static void mainLoop(void) {
 	SDL_GameControllerUpdate();
 	ReadGamepadInput(&buttons_state);
 
-	if (!((prev_buttons_state >> PSEUDO_BTN_PAUSE) & 1)
+	if (host_menu != HOST_MENU_NONE) {
+		if (!((prev_buttons_state >> PSEUDO_BTN_PAUSE) & 1)
+		 && (buttons_state >> PSEUDO_BTN_PAUSE) & 1) {
+			if (host_menu == HOST_MENU_STATS) HostSetMenu(HOST_MENU_MAIN);
+			else HostSetMenu(HOST_MENU_NONE);
+		}
+		if (host_menu == HOST_MENU_MAIN
+		 && !((prev_buttons_state >> 2) & 1) && ((buttons_state >> 2) & 1))
+			host_menu_selection = (host_menu_selection + 3) % 4;
+		if (host_menu == HOST_MENU_MAIN
+		 && !((prev_buttons_state >> 3) & 1) && ((buttons_state >> 3) & 1))
+			host_menu_selection = (host_menu_selection + 1) % 4;
+		if (!((prev_buttons_state >> 4) & 1) && ((buttons_state >> 4) & 1))
+			HostActivateMenuSelection();
+		if (host_menu == HOST_MENU_STATS
+		 && !((prev_buttons_state >> 5) & 1) && ((buttons_state >> 5) & 1))
+			HostSetMenu(HOST_MENU_MAIN);
+	} else if (!((prev_buttons_state >> PSEUDO_BTN_PAUSE) & 1)
 	 && (buttons_state >> PSEUDO_BTN_PAUSE) & 1) {
 		goto toggle_pause;
 	}
 
-	if (!((prev_buttons_state >> PSEUDO_BTN_EXIT) & 1)
+	if (host_menu == HOST_MENU_NONE
+	 && !((prev_buttons_state >> PSEUDO_BTN_EXIT) & 1)
 	 && (buttons_state >> PSEUDO_BTN_EXIT) & 1) {
 		goto press_exit;
 	}
 
-	if (!((prev_buttons_state >> PSEUDO_BTN_SAVE_STATE) & 1)
+	if (host_menu == HOST_MENU_NONE
+	 && !((prev_buttons_state >> PSEUDO_BTN_SAVE_STATE) & 1)
 	 && (buttons_state >> PSEUDO_BTN_SAVE_STATE) & 1) {
 		goto save_state;
 	}
 
-	if (!((prev_buttons_state >> PSEUDO_BTN_LOAD_STATE) & 1)
+	if (host_menu == HOST_MENU_NONE
+	 && !((prev_buttons_state >> PSEUDO_BTN_LOAD_STATE) & 1)
 	 && (buttons_state >> PSEUDO_BTN_LOAD_STATE) & 1) {
 		goto load_state;
 	}
@@ -475,14 +906,68 @@ static void mainLoop(void) {
 	SDL_Event ev;
 	while (SDL_PollEvent(&ev)) switch (ev.type) {
 		case SDL_QUIT: running = 0; break;
+#if SDL_MAJOR_VERSION >= 2
+		case SDL_WINDOWEVENT:
+			if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST
+			 || ev.window.event == SDL_WINDOWEVENT_MINIMIZED) {
+				host_has_focus = 0;
+				Mix_Pause(-1);
+				Mix_PauseMusic();
+			} else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+				host_has_focus = 1;
+				host_previous_tick = SDL_GetTicks();
+				if (!paused) {
+					Mix_Resume(-1);
+					Mix_ResumeMusic();
+				}
+			}
+			break;
+#else
+		case SDL_ACTIVEEVENT:
+			if (ev.active.state & SDL_APPINPUTFOCUS) {
+				host_has_focus = ev.active.gain != 0;
+				if (!host_has_focus) {
+					Mix_Pause(-1);
+					Mix_PauseMusic();
+				} else if (!paused) {
+					host_previous_tick = SDL_GetTicks();
+					Mix_Resume(-1);
+					Mix_ResumeMusic();
+				}
+			}
+			break;
+#endif
 		case SDL_KEYDOWN: {
 #if SDL_MAJOR_VERSION >= 2
 			if (ev.key.repeat) break; //no key repeat
 #endif
+			if (host_menu != HOST_MENU_NONE) {
+				if (ev.key.keysym.sym == SDLK_ESCAPE) {
+					if (host_menu == HOST_MENU_STATS) HostSetMenu(HOST_MENU_MAIN);
+					else HostSetMenu(HOST_MENU_NONE);
+				} else if (host_menu == HOST_MENU_MAIN && ev.key.keysym.sym == SDLK_UP) {
+					host_menu_selection = (host_menu_selection + 3) % 4;
+				} else if (host_menu == HOST_MENU_MAIN && ev.key.keysym.sym == SDLK_DOWN) {
+					host_menu_selection = (host_menu_selection + 1) % 4;
+				} else if (ev.key.keysym.sym == SDLK_z
+#if SDL_MAJOR_VERSION >= 2
+					|| ev.key.keysym.sym == SDL_SCANCODE_RETURN
+#else
+					|| ev.key.keysym.sym == SDLK_RETURN
+#endif
+				) {
+					HostActivateMenuSelection();
+				}
+				break;
+			}
 			if (ev.key.keysym.sym == SDLK_ESCAPE) { //do pause
 				toggle_pause:
+			#if HOST_PANEL_W > 0
+				HostSetMenu(HOST_MENU_MAIN);
+			#else
 				if (paused) Mix_Resume(-1), Mix_ResumeMusic(); else Mix_Pause(-1), Mix_PauseMusic();
 				paused = !paused;
+			#endif
 				break;
 			} else if (ev.key.keysym.sym == SDLK_DELETE) { //exit
 				press_exit:
@@ -504,6 +989,9 @@ static void mainLoop(void) {
 					OSDset("save state");
 					Celeste_P8_save_state(game_state);
 					game_state_music = current_music;
+					game_state_run_stats = host_run_stats;
+					game_state_run_millis = host_run_millis;
+					game_state_run_finished = host_run_finished;
 				}
 				break;
 			} else if (ev.key.keysym.sym == SDLK_d && kbstate[SDLK_LSHIFT]) { //load state
@@ -512,6 +1000,13 @@ static void mainLoop(void) {
 					OSDset("load state");
 					if (paused) paused = 0, Mix_Resume(-1), Mix_ResumeMusic();
 					Celeste_P8_load_state(game_state);
+					host_run_stats = game_state_run_stats;
+					host_run_millis = game_state_run_millis;
+					host_run_finished = game_state_run_finished;
+					Celeste_P8_get_telemetry(&host_previous_telemetry);
+					host_telemetry_ready = 1;
+					host_previous_tick = SDL_GetTicks();
+					host_last_room = host_previous_telemetry.room;
 					if (current_music != game_state_music) {
 						Mix_HaltMusic();
 						current_music = game_state_music;
@@ -531,8 +1026,9 @@ static void mainLoop(void) {
 			} break;
 		}
 	}
+	if (menu_was_open && host_menu == HOST_MENU_NONE) host_consume_game_input = 1;
 
-	if (!TAS) {
+	if (!TAS && host_menu == HOST_MENU_NONE) {
 		if (kbstate[SDLK_LEFT])  buttons_state |= (1<<0);
 		if (kbstate[SDLK_RIGHT]) buttons_state |= (1<<1);
 		if (kbstate[SDLK_UP])    buttons_state |= (1<<2);
@@ -549,18 +1045,27 @@ static void mainLoop(void) {
 			buttons_state = btn;
 		} else buttons_state = 0;
 	}
+	if (host_consume_game_input) {
+		if (buttons_state & 0x3f) buttons_state &= (Uint16)~0x3f;
+		else host_consume_game_input = 0;
+	}
 
 	if (paused) {
+#if HOST_PANEL_W == 0
 		const int x0 = PICO8_W/2-3*4, y0 = 8;
 
 		p8_rectfill(x0-1,y0-1, 6*4+x0+1,6+y0+1, 6);
 		p8_rectfill(x0,y0, 6*4+x0,6+y0, 0);
 		p8_print("paused", x0+1, y0+1, 7);
-	} else {
+#endif
+	} else if (host_has_focus) {
 		Celeste_P8_update();
 		Celeste_P8_draw();
 	}
+	HostUpdateStats();
 	OSDdraw();
+	HostDrawTimer();
+	HostDrawMenu();
 
 	SDL_Flip(screen);
 

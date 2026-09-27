@@ -1,0 +1,79 @@
+name: Release desktop builds
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - run: brew install sdl2 sdl2_mixer
+      - run: ./scripts/package-macos.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-${{ matrix.arch }}-release
+          path: dist/ccleste-macos-${{ matrix.arch }}.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: msys2/setup-msys2@40677d36a502eb2cf0fb808cc9dec31bf6152638
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL2_mixer
+            zip
+      - shell: msys2 {0}
+        run: ./scripts/package-windows.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-release
+          path: dist/ccleste-windows.zip
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: release-assets
+          merge-multiple: true
+      - run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/*.zip --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/*.zip --generate-notes
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
