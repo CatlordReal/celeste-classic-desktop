@@ -30,6 +30,7 @@ extern void Celeste_P8__DEBUG(void); //debug functionality
 typedef struct {
 	uint64_t jumps, dashes, climb_pixels, completions;
 	int room, deaths, is_title;
+	uint32_t fruit_mask;
 } Celeste_P8_Telemetry;
 void Celeste_P8_get_telemetry(Celeste_P8_Telemetry* out);
 

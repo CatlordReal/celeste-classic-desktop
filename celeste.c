@@ -2010,6 +2010,9 @@ void Celeste_P8__DEBUG(void) {
 
 void Celeste_P8_get_telemetry(Celeste_P8_Telemetry* out) {
 	if (!out) return;
+	uint32_t fruit_mask = 0;
+	for (int i = 0; i < FRUIT_COUNT; i++)
+		if (got_fruit[i]) fruit_mask |= 1u << i;
 	out->jumps = host_jumps;
 	out->dashes = host_dashes;
 	out->climb_pixels = host_climb_units / 1024;
@@ -2017,6 +2020,7 @@ void Celeste_P8_get_telemetry(Celeste_P8_Telemetry* out) {
 	out->room = level_index();
 	out->deaths = deaths;
 	out->is_title = is_title();
+	out->fruit_mask = fruit_mask;
 }
 
 //all of the global game variables; this holds the entire game state (exc. music/sounds playing)

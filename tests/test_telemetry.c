@@ -26,11 +26,12 @@ static int callback(CELESTE_P8_CALLBACK_TYPE type, ...) {
 
 int main(void) {
     Celeste_P8_Telemetry t = {0};
+    assert(Celeste_P8_get_state_size() == 76491);
     Celeste_P8_set_call_func(callback);
     Celeste_P8_set_rndseed(8);
     Celeste_P8_init();
     Celeste_P8_get_telemetry(&t);
-    assert(t.is_title && t.jumps == 0 && t.dashes == 0);
+    assert(t.is_title && t.jumps == 0 && t.dashes == 0 && t.fruit_mask == 0);
 
     Celeste_P8__DEBUG();
     for (int i = 0; i < 100; i++) Celeste_P8_update();
@@ -59,13 +60,17 @@ int main(void) {
     void *state = malloc(Celeste_P8_get_state_size());
     assert(state);
     Celeste_P8_save_state(state);
+    const size_t got_fruit_offset =
+        sizeof(unsigned) * 2 + sizeof(int) * 4 + sizeof(Celeste_P8_bool_t) + sizeof(int);
+    ((unsigned char *)state)[got_fruit_offset + 3] = 1;
     Celeste_P8_init();
     Celeste_P8_get_telemetry(&t);
-    assert(t.is_title && t.jumps == 0 && t.dashes == 0);
+    assert(t.is_title && t.jumps == 0 && t.dashes == 0 && t.fruit_mask == 0);
     Celeste_P8_load_state(state);
     Celeste_P8_get_telemetry(&t);
     assert(!t.is_title && t.jumps == saved.jumps && t.dashes == saved.dashes);
     assert(t.climb_pixels == saved.climb_pixels);
+    assert(t.fruit_mask == (1u << 3));
     free(state);
     return 0;
 }

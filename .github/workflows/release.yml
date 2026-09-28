@@ -55,10 +55,28 @@ jobs:
             zip
       - shell: msys2 {0}
         run: ./scripts/package-windows.sh
+      - shell: pwsh
+        run: |
+          $extract = Join-Path $env:RUNNER_TEMP 'celeste-installer-smoke'
+          Expand-Archive dist/ccleste-windows-installer.zip -DestinationPath $extract
+          $payload = Join-Path $extract 'ccleste-windows-installer'
+          & (Join-Path $payload 'Install-CelesteClassic.cmd')
+          if ($LASTEXITCODE -ne 0) { throw 'Installer failed' }
+          $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CelesteClassic'
+          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Celeste Classic.lnk'
+          if (-not (Test-Path -LiteralPath (Join-Path $installed 'ccleste.exe'))) { throw 'Game was not installed' }
+          if (-not (Test-Path -LiteralPath $shortcut)) { throw 'Start menu shortcut was not created' }
+          & (Join-Path $payload 'Install-CelesteClassic.cmd') -Force
+          if ($LASTEXITCODE -ne 0) { throw 'Installer update failed' }
+          & (Join-Path $installed 'Uninstall-CelesteClassic.cmd')
+          if ($LASTEXITCODE -ne 0) { throw 'Uninstaller failed' }
+          if ((Test-Path -LiteralPath $installed) -or (Test-Path -LiteralPath $shortcut)) { throw 'Uninstall did not remove installed files and shortcut' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-release
-          path: dist/ccleste-windows.zip
+          path: |
+            dist/ccleste-windows.zip
+            dist/ccleste-windows-installer.zip
 
   publish:
     needs: [macos, windows]

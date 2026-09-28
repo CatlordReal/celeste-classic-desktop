@@ -22,6 +22,8 @@
 #include <3ds.h>
 #endif
 #include "celeste.h"
+#include "desktop_backup.h"
+#include "desktop_stats.h"
 
 static void ErrLog(char* fmt, ...) {
 #ifdef _3DS
@@ -257,15 +259,6 @@ enum HostMenu {
 	HOST_MENU_STATS,
 };
 
-typedef struct {
-	uint64_t jumps;
-	uint64_t dashes;
-	uint64_t climb_pixels;
-	uint64_t deaths;
-	uint64_t completions;
-	uint64_t ingame_millis;
-} HostTotals;
-
 static enum HostMenu host_menu = HOST_MENU_NONE;
 static int host_menu_selection = 0;
 static HostTotals host_totals;
@@ -284,6 +277,9 @@ static Uint32 host_last_save_tick = 0;
 static int host_last_room = -1;
 static char host_save_path[4096] = "";
 static char host_save_tmp_path[4096] = "";
+static char host_backup_path[4096] = "";
+static char host_backup_tmp_path[4096] = "";
+static _Bool host_save_enabled = 1;
 
 static void HostInitPersistence(void);
 static void HostUpdateStats(void);
@@ -328,59 +324,14 @@ static Uint8 *n3ds_get_fake_key_state(int *numkeys) {
 #endif
 
 #if !defined(_3DS) && !defined(EMSCRIPTEN)
-typedef struct {
-	char magic[8];
-	uint32_t version;
-	uint32_t state_size;
-	uint32_t checksum;
-	int32_t music_index;
-	uint64_t run_millis;
-	uint32_t run_finished;
-	uint32_t reserved;
-	HostTotals run_stats;
-	HostTotals totals;
-} HostSaveHeader;
-
-static uint32_t HostChecksum(const void* data, size_t size, uint32_t hash) {
-	const unsigned char* bytes = data;
-	for (size_t i = 0; i < size; i++) {
-		hash ^= bytes[i];
-		hash *= 16777619u;
-	}
-	return hash;
-}
-
-static _Bool HostFlushFile(FILE* file) {
-	if (fflush(file) != 0) return 0;
-#ifdef _WIN32
-	return _commit(_fileno(file)) == 0;
-#else
-	return fsync(fileno(file)) == 0;
-#endif
-}
-
-static FILE* HostOpenFile(const char* path, const char* mode) {
-#ifdef _WIN32
-	WCHAR wide_path[4096];
-	WCHAR wide_mode[8];
-	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
-		wide_path, (int)(sizeof wide_path / sizeof *wide_path))) return NULL;
-	if (!MultiByteToWideChar(CP_UTF8, 0, mode, -1,
-		wide_mode, (int)(sizeof wide_mode / sizeof *wide_mode))) return NULL;
-	return _wfopen(wide_path, wide_mode);
-#else
-	return fopen(path, mode);
-#endif
-}
-
 static _Bool HostReplaceFile(const char* source, const char* destination) {
 #ifdef _WIN32
 	WCHAR wide_source[4096];
 	WCHAR wide_destination[4096];
-	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, source, -1,
-		wide_source, (int)(sizeof wide_source / sizeof *wide_source))) return 0;
-	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, destination, -1,
-		wide_destination, (int)(sizeof wide_destination / sizeof *wide_destination))) return 0;
+	if (!DesktopWidePath(source, wide_source,
+		(int)(sizeof wide_source / sizeof *wide_source))) return 0;
+	if (!DesktopWidePath(destination, wide_destination,
+		(int)(sizeof wide_destination / sizeof *wide_destination))) return 0;
 	return MoveFileExW(wide_source, wide_destination,
 		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
@@ -393,6 +344,26 @@ static int HostCurrentMusicIndex(void) {
 		if (current_music == mus[i]) return i;
 	}
 	return -1;
+}
+
+static _Bool HostV2StatsValid(const HostSaveHeaderV2* header) {
+	return header->run_millis <= header->totals.ingame_millis
+		&& header->run_stats.jumps <= header->totals.jumps
+		&& header->run_stats.dashes <= header->totals.dashes
+		&& header->run_stats.climb_pixels <= header->totals.climb_pixels
+		&& header->run_stats.deaths <= header->totals.deaths
+		&& header->run_stats.completions <= header->totals.completions;
+}
+
+static _Bool HostV3StatsValid(const HostSaveHeaderV3* header) {
+	return header->run_millis <= header->totals.ingame_millis
+		&& header->run_stats.jumps <= header->totals.jumps
+		&& header->run_stats.dashes <= header->totals.dashes
+		&& header->run_stats.climb_pixels <= header->totals.climb_pixels
+		&& header->run_stats.deaths <= header->totals.deaths
+		&& header->run_stats.completions <= header->totals.completions
+		&& header->run_stats.strawberries <= header->totals.strawberries
+		&& header->run_stats.stages <= header->totals.stages;
 }
 #endif
 
@@ -408,6 +379,19 @@ static void HostFormatDuration(char* output, size_t output_size, uint64_t millis
 		snprintf(output, output_size, "%lluh %02um %02us",
 			(unsigned long long)hours, minutes, seconds);
 	}
+}
+
+static void HostFormatCount(char* output, size_t output_size, uint64_t value) {
+	if (value < 10000u)
+		snprintf(output, output_size, "%llu", (unsigned long long)value);
+	else if (value < 1000000u)
+		snprintf(output, output_size, "%lluK", (unsigned long long)(value / 1000u));
+	else if (value < 1000000000u)
+		snprintf(output, output_size, "%lluM", (unsigned long long)(value / 1000000u));
+	else if (value < 1000000000000u)
+		snprintf(output, output_size, "%lluB", (unsigned long long)(value / 1000000000u));
+	else
+		snprintf(output, output_size, "999+");
 }
 
 static void HostSetMenu(enum HostMenu menu) {
@@ -477,30 +461,49 @@ static void HostInitPersistence(void) {
 	}
 	snprintf(host_save_path, sizeof host_save_path, "%sprogress.dat", preference_path);
 	snprintf(host_save_tmp_path, sizeof host_save_tmp_path, "%sprogress.tmp", preference_path);
+	snprintf(host_backup_path, sizeof host_backup_path, "%sprogress.v2.bak", preference_path);
+	snprintf(host_backup_tmp_path, sizeof host_backup_tmp_path, "%sprogress.v2.bak.tmp", preference_path);
 	SDL_free(preference_path);
 
-	FILE* file = HostOpenFile(host_save_path, "rb");
+	FILE* file = DesktopOpenFile(host_save_path, "rb");
 	if (!file) return;
-	HostSaveHeader header;
-	memset(&header, 0, sizeof header);
-	_Bool valid = fread(&header, sizeof header, 1, file) == 1;
+	HostSaveHeaderV2 header_v2;
+	HostSaveHeaderV3 header_v3;
+	memset(&header_v2, 0, sizeof header_v2);
+	memset(&header_v3, 0, sizeof header_v3);
+	_Bool valid = fread(&header_v2, sizeof header_v2, 1, file) == 1;
+	_Bool migrate_v2 = valid
+		&& memcmp(header_v2.magic, HOST_SAVE_V2_MAGIC, 8) == 0
+		&& header_v2.version == HOST_SAVE_V2_VERSION;
+	_Bool load_v3 = valid
+		&& memcmp(header_v2.magic, HOST_SAVE_V3_MAGIC, 8) == 0
+		&& header_v2.version == HOST_SAVE_V3_VERSION;
+	if (load_v3) {
+		valid = fseek(file, 0, SEEK_SET) == 0
+			&& fread(&header_v3, sizeof header_v3, 1, file) == 1;
+	} else if (!migrate_v2) {
+		valid = 0;
+	}
 	size_t state_size = Celeste_P8_get_state_size();
-	valid = valid && memcmp(header.magic, "CCLSTSV2", 8) == 0;
-	valid = valid && header.version == 2 && header.state_size == state_size;
-	valid = valid && header.run_finished <= 1;
-	valid = valid && header.music_index >= -1 && header.music_index < (int)(sizeof mus / sizeof *mus);
-	valid = valid && header.run_millis <= header.totals.ingame_millis;
-	valid = valid && header.run_stats.jumps <= header.totals.jumps;
-	valid = valid && header.run_stats.dashes <= header.totals.dashes;
-	valid = valid && header.run_stats.climb_pixels <= header.totals.climb_pixels;
-	valid = valid && header.run_stats.deaths <= header.totals.deaths;
-	valid = valid && header.run_stats.completions <= header.totals.completions;
+	uint32_t saved_state_size = migrate_v2 ? header_v2.state_size : header_v3.state_size;
+	uint32_t run_finished = migrate_v2 ? header_v2.run_finished : header_v3.run_finished;
+	int music_index = migrate_v2 ? header_v2.music_index : header_v3.music_index;
+	valid = valid && saved_state_size == state_size;
+	valid = valid && run_finished <= 1;
+	valid = valid && music_index >= -1 && music_index < (int)(sizeof mus / sizeof *mus);
+	valid = valid && (migrate_v2 ? HostV2StatsValid(&header_v2) : HostV3StatsValid(&header_v3));
 	void* state = valid ? SDL_malloc(state_size) : NULL;
 	valid = valid && state && fread(state, state_size, 1, file) == 1;
 	valid = valid && fgetc(file) == EOF && !ferror(file);
-	uint32_t expected_checksum = header.checksum;
-	header.checksum = 0;
-	uint32_t checksum = HostChecksum(&header, sizeof header, 2166136261u);
+	uint32_t expected_checksum = migrate_v2 ? header_v2.checksum : header_v3.checksum;
+	uint32_t checksum;
+	if (migrate_v2) {
+		header_v2.checksum = 0;
+		checksum = HostChecksum(&header_v2, sizeof header_v2, 2166136261u);
+	} else {
+		header_v3.checksum = 0;
+		checksum = HostChecksum(&header_v3, sizeof header_v3, 2166136261u);
+	}
 	if (valid) checksum = HostChecksum(state, state_size, checksum);
 	valid = valid && checksum == expected_checksum;
 	fclose(file);
@@ -510,27 +513,51 @@ static void HostInitPersistence(void) {
 		if (state) SDL_free(state);
 		return;
 	}
+	_Bool migration_backup_ready = !migrate_v2 || DesktopPreserveBackup(
+		host_save_path, host_backup_path, host_backup_tmp_path);
+	if (!migration_backup_ready) {
+		host_save_enabled = 0;
+		ErrLog("couldn't preserve V2 backup; progress remains read-only: %s\n", host_backup_path);
+	}
 
 	Celeste_P8_load_state(state);
 	SDL_free(state);
-	host_totals = header.totals;
-	host_run_stats = header.run_stats;
-	host_run_millis = header.run_millis;
-	host_run_finished = (_Bool)header.run_finished;
+	if (migrate_v2) {
+		HostSaveHeaderV3 migrated_header;
+		Celeste_P8_get_telemetry(&host_previous_telemetry);
+		HostMigrateV2Header(
+			&migrated_header, &header_v2,
+			host_previous_telemetry.fruit_mask,
+			host_previous_telemetry.room);
+		host_totals = migrated_header.totals;
+		host_run_stats = migrated_header.run_stats;
+	} else {
+		host_totals = header_v3.totals;
+		host_run_stats = header_v3.run_stats;
+	}
+	host_run_millis = migrate_v2 ? header_v2.run_millis : header_v3.run_millis;
+	host_run_finished = (_Bool)run_finished;
 	Mix_HaltMusic();
 	current_music = NULL;
-	if (header.music_index >= 0 && mus[header.music_index]) {
-		current_music = mus[header.music_index];
+	if (music_index >= 0 && mus[music_index]) {
+		current_music = mus[music_index];
 		Mix_PlayMusic(current_music, -1);
 	}
 	Celeste_P8_get_telemetry(&host_previous_telemetry);
 	host_last_room = host_previous_telemetry.room;
-	OSDset("progress loaded");
+	if (migrate_v2 && migration_backup_ready) {
+		HostSaveProgress();
+		OSDset("progress upgraded");
+	} else if (migrate_v2) {
+		OSDset("backup failed; save off");
+	} else {
+		OSDset("progress loaded");
+	}
 #endif
 }
 
 static void HostSaveProgress(void) {
-	if (TAS || !host_telemetry_ready || !host_save_path[0]) return;
+	if (TAS || !host_save_enabled || !host_telemetry_ready || !host_save_path[0]) return;
 #if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
 	size_t state_size = Celeste_P8_get_state_size();
 	if (state_size > UINT32_MAX) return;
@@ -538,10 +565,10 @@ static void HostSaveProgress(void) {
 	if (!state) return;
 	Celeste_P8_save_state(state);
 
-	HostSaveHeader header;
+	HostSaveHeaderV3 header;
 	memset(&header, 0, sizeof header);
-	memcpy(header.magic, "CCLSTSV2", 8);
-	header.version = 2;
+	memcpy(header.magic, HOST_SAVE_V3_MAGIC, 8);
+	header.version = HOST_SAVE_V3_VERSION;
 	header.state_size = (uint32_t)state_size;
 	header.music_index = HostCurrentMusicIndex();
 	header.run_millis = host_run_millis;
@@ -551,11 +578,11 @@ static void HostSaveProgress(void) {
 	header.checksum = HostChecksum(&header, sizeof header, 2166136261u);
 	header.checksum = HostChecksum(state, state_size, header.checksum);
 
-	FILE* file = HostOpenFile(host_save_tmp_path, "wb");
+	FILE* file = DesktopOpenFile(host_save_tmp_path, "wb");
 	_Bool saved = file != NULL;
 	saved = saved && fwrite(&header, sizeof header, 1, file) == 1;
 	saved = saved && fwrite(state, state_size, 1, file) == 1;
-	saved = saved && HostFlushFile(file);
+	saved = saved && DesktopFlushFile(file);
 	if (file && fclose(file) != 0) saved = 0;
 	if (saved) saved = HostReplaceFile(host_save_tmp_path, host_save_path);
 	if (!saved) {
@@ -601,6 +628,14 @@ static void HostUpdateStats(void) {
 			host_run_stats.deaths += delta;
 			host_totals.deaths += delta;
 		}
+		uint64_t strawberries = HostCountNewStrawberries(
+			host_previous_telemetry.fruit_mask, telemetry.fruit_mask);
+		host_run_stats.strawberries += strawberries;
+		host_totals.strawberries += strawberries;
+		uint64_t stages = HostCompletedStage(
+			host_previous_telemetry.room, telemetry.room);
+		host_run_stats.stages += stages;
+		host_totals.stages += stages;
 	}
 
 	if (!paused && host_has_focus && !telemetry.is_title) {
@@ -664,25 +699,29 @@ static void HostDrawMenu(void) {
 	char line[64], run_time[32], total_time[32];
 	HostFormatDuration(run_time, sizeof run_time, host_run_millis, 0);
 	HostFormatDuration(total_time, sizeof total_time, host_totals.ingame_millis, 0);
-	p8_print("stats", panel_x, 5, 7);
-	p8_print("current / all time", panel_x, 15, 6);
+	p8_print("stats", panel_x, 4, 7);
+	p8_print("current / all time", panel_x, 14, 6);
 #define DRAW_STAT(y, label, current, total) do { \
-		snprintf(line, sizeof line, "%s %llu/%llu", label, \
-			(unsigned long long)(current), (unsigned long long)(total)); \
+		char current_text[8], total_text[8]; \
+		HostFormatCount(current_text, sizeof current_text, (uint64_t)(current)); \
+		HostFormatCount(total_text, sizeof total_text, (uint64_t)(total)); \
+		snprintf(line, sizeof line, "%s %s/%s", label, current_text, total_text); \
 		p8_print(line, panel_x, y, 7); \
 	} while (0)
-	DRAW_STAT(27, "jumps", host_run_stats.jumps, host_totals.jumps);
-	DRAW_STAT(38, "dashes", host_run_stats.dashes, host_totals.dashes);
-	DRAW_STAT(49, "climbed m", host_run_stats.climb_pixels * 100u / 128u,
+	DRAW_STAT(25, "jumps", host_run_stats.jumps, host_totals.jumps);
+	DRAW_STAT(34, "dashes", host_run_stats.dashes, host_totals.dashes);
+	DRAW_STAT(43, "berries", host_run_stats.strawberries, host_totals.strawberries);
+	DRAW_STAT(52, "stages", host_run_stats.stages, host_totals.stages);
+	DRAW_STAT(61, "climbed m", host_run_stats.climb_pixels * 100u / 128u,
 		host_totals.climb_pixels * 100u / 128u);
-	DRAW_STAT(60, "deaths", host_run_stats.deaths, host_totals.deaths);
-	DRAW_STAT(71, "completions", host_run_stats.completions, host_totals.completions);
+	DRAW_STAT(70, "deaths", host_run_stats.deaths, host_totals.deaths);
+	DRAW_STAT(79, "completions", host_run_stats.completions, host_totals.completions);
 #undef DRAW_STAT
 	snprintf(line, sizeof line, "time %s", run_time);
-	p8_print(line, panel_x, 82, 7);
+	p8_print(line, panel_x, 90, 7);
 	snprintf(line, sizeof line, "all  %s", total_time);
-	p8_print(line, panel_x, 93, 7);
-	p8_print("z/enter/esc: back", panel_x, 112, 5);
+	p8_print(line, panel_x, 99, 7);
+	p8_print("z/enter/esc: back", panel_x, 113, 5);
 #endif
 }
 

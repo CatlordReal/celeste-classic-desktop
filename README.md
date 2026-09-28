@@ -8,7 +8,9 @@ Go to [this project's releases](https://github.com/CatlordReal/celeste-classic-d
 
 ## Desktop downloads
 
-Download and unzip the archive for your platform: `ccleste-windows.zip`, `ccleste-macos-arm64.zip` for Apple Silicon, or `ccleste-macos-x86_64.zip` for Intel Macs. Windows: run `ccleste.exe`. macOS: open `Celeste Classic.app`. Both launchers set the game directory before starting, so the bundled `data/`, controller database, and SDL runtime libraries work regardless of the directory from which they were launched.
+Download and unzip the archive for your platform: `ccleste-windows.zip`, `ccleste-windows-installer.zip`, `ccleste-macos-arm64.zip` for Apple Silicon, or `ccleste-macos-x86_64.zip` for Intel Macs. Windows portable: run `ccleste.exe`. macOS: open `Celeste Classic.app`. Both launchers set the game directory before starting, so the bundled `data/`, controller database, and SDL runtime libraries work regardless of the directory from which they were launched.
+
+For a per-user Windows install, unzip `ccleste-windows-installer.zip` and run `Install-CelesteClassic.cmd`. It installs to `%LOCALAPPDATA%\CelesteClassic` without administrator access and creates a Start menu shortcut. It refuses to replace an unknown folder. Reinstalling a known copy requires `Install-CelesteClassic.cmd -Force`; it stages the new files before replacing the old copy. Run the installed `Uninstall-CelesteClassic.cmd` to remove the game and its shortcut. The `.cmd` launchers use a process-scoped PowerShell execution policy so they work with default Windows script restrictions. Uninstalling keeps saved progress at `%LOCALAPPDATA%\celeste-classic\celeste-classic\progress.dat`.
 
 The macOS release builds target macOS 15 or later. Windows builds target 64-bit Windows.
 
@@ -64,9 +66,9 @@ You can make the game start up in fullscreen by setting the environment variable
 
 ## Saves and run statistics
 
-Progress saves automatically when a stage changes, every 10 seconds, on reset, and on exit. Reopening the game restores the saved stage and run. Press Escape or controller Start for the host menu. **Stats** shows current-run and all-time jumps, dashes, deaths, completions, climbed metres, and time. **Reset to start** clears the run and keeps all-time stats. The side panel shows a speedrun timer that stops at the first summit completion; menus and lost focus pause it.
+Progress saves automatically when a stage changes, every 10 seconds, on reset, and on exit. Reopening the game restores the saved stage and run. Press Escape or controller Start for the host menu. **Stats** shows current-run and all-time jumps, dashes, deaths, berries, stages, climbed metres, and time. **Reset to start** clears the run and keeps all-time stats. The side panel shows a speedrun timer that stops at the first summit completion; menus and lost focus pause it.
 
-Climbed distance counts upward player movement, with 128 game pixels displayed as 100 metres. Total in-game time counts active gameplay, including time after a run finishes. `SHIFT+S` and `SHIFT+D` remain separate in-memory save/load controls. Persistent saves use the platform's SDL preference directory; controller mappings remain in `ccleste-input-cfg.txt` in the game directory or the path set by `CCLESTE_INPUT_CFG_PATH`.
+Climbed distance counts upward player movement, with 128 game pixels displayed as 100 metres. Total in-game time counts active gameplay, including time after a run finishes. V2 save migration preserves existing six current and all-time fields, then seeds berries from collected fruit and stages from the saved room; it cannot reconstruct older lifetime totals for either metric. `SHIFT+S` and `SHIFT+D` remain separate in-memory save/load controls. Persistent saves use the platform's SDL preference directory; controller mappings remain in `ccleste-input-cfg.txt` in the game directory or the path set by `CCLESTE_INPUT_CFG_PATH`.
 
 # TAS playback and the fixed point question
 

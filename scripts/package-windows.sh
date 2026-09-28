@@ -35,3 +35,17 @@ mkdir -p "$root/dist"
     rm -f ccleste-windows.zip
     zip -9rq ccleste-windows.zip ccleste-windows
 )
+
+installer="$root/dist/ccleste-windows-installer"
+rm -rf "$installer"
+mkdir -p "$installer"
+cp -R "$out"/. "$installer/"
+cp "$root/scripts/Install-CelesteClassic.ps1" "$installer/"
+cp "$root/scripts/Uninstall-CelesteClassic.ps1" "$installer/"
+cp "$root/scripts/Install-CelesteClassic.cmd" "$installer/"
+cp "$root/scripts/Uninstall-CelesteClassic.cmd" "$installer/"
+(
+    cd "$root/dist"
+    rm -f ccleste-windows-installer.zip
+    zip -9rq ccleste-windows-installer.zip ccleste-windows-installer
+)
