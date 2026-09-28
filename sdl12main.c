@@ -24,6 +24,9 @@
 #include "celeste.h"
 #include "desktop_backup.h"
 #include "desktop_stats.h"
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+#include "desktop_records.h"
+#endif
 
 static void ErrLog(char* fmt, ...) {
 #ifdef _3DS
@@ -257,17 +260,29 @@ enum HostMenu {
 	HOST_MENU_NONE,
 	HOST_MENU_MAIN,
 	HOST_MENU_STATS,
+	HOST_MENU_RECORD_CATEGORIES,
+	HOST_MENU_RECORD_ROOMS,
+	HOST_MENU_PRACTICE,
 };
 
 static enum HostMenu host_menu = HOST_MENU_NONE;
 static int host_menu_selection = 0;
 static HostTotals host_totals;
 static HostTotals host_run_stats;
+static HostBestTimes host_best_times;
 static HostTotals game_state_run_stats;
 static uint64_t host_run_millis = 0;
 static uint64_t game_state_run_millis = 0;
+static uint32_t host_run_timer_remainder = 0;
+static uint32_t game_state_run_timer_remainder = 0;
 static _Bool host_run_finished = 0;
 static _Bool game_state_run_finished = 0;
+static _Bool host_practice_mode = 0;
+static int host_practice_category = 0;
+static int host_practice_room = 0;
+static void* host_practice_return_state = NULL;
+static void* host_practice_room_state = NULL;
+static Mix_Music* host_practice_return_music = NULL;
 static _Bool host_has_focus = 1;
 static _Bool host_consume_game_input = 0;
 static Celeste_P8_Telemetry host_previous_telemetry;
@@ -289,6 +304,10 @@ static void HostDrawTimer(void);
 static void HostDrawMenu(void);
 static void HostSetMenu(enum HostMenu menu);
 static void HostActivateMenuSelection(void);
+static void HostSetPracticeMode(_Bool enabled);
+static _Bool HostStartPractice(int category, int room);
+static void HostRetryPractice(void);
+static void HostEndPractice(void);
 
 #ifdef _3DS
 // hack: newer SDL versions remove SDL_N3DSKeyBind, but I'm too lazy to change the
@@ -365,6 +384,18 @@ static _Bool HostV3StatsValid(const HostSaveHeaderV3* header) {
 		&& header->run_stats.strawberries <= header->totals.strawberries
 		&& header->run_stats.stages <= header->totals.stages;
 }
+
+static _Bool HostV4StatsValid(const HostSaveHeaderV4* header) {
+	return header->run_timer_remainder < 30u
+		&& header->run_millis <= header->totals.ingame_millis
+		&& header->run_stats.jumps <= header->totals.jumps
+		&& header->run_stats.dashes <= header->totals.dashes
+		&& header->run_stats.climb_pixels <= header->totals.climb_pixels
+		&& header->run_stats.deaths <= header->totals.deaths
+		&& header->run_stats.completions <= header->totals.completions
+		&& header->run_stats.strawberries <= header->totals.strawberries
+		&& header->run_stats.stages <= header->totals.stages;
+}
 #endif
 
 static void HostFormatDuration(char* output, size_t output_size, uint64_t millis, _Bool centiseconds) {
@@ -400,7 +431,7 @@ static void HostSetMenu(enum HostMenu menu) {
 		paused = 0;
 		if (host_has_focus) {
 			Mix_Resume(-1);
-			Mix_ResumeMusic();
+			if (!host_practice_mode) Mix_ResumeMusic();
 		}
 		return;
 	}
@@ -412,7 +443,117 @@ static void HostSetMenu(enum HostMenu menu) {
 	paused = 1;
 }
 
+static void HostSetPracticeMode(_Bool enabled) {
+	/* Caller restores its pre-practice game snapshot before disabling. */
+	host_practice_mode = enabled;
+	Celeste_P8_get_telemetry(&host_previous_telemetry);
+	host_telemetry_ready = 1;
+	host_last_room = host_previous_telemetry.room;
+	host_previous_tick = SDL_GetTicks();
+}
+
+static void HostEndPractice(void) {
+	if (!host_practice_mode) return;
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	DesktopRecordStopPractice();
+#endif
+	if (host_practice_return_state) Celeste_P8_load_state(host_practice_return_state);
+	Mix_HaltChannel(-1);
+	Mix_HaltMusic();
+	current_music = host_practice_return_music;
+	if (current_music) {
+		Mix_PlayMusic(current_music, -1);
+		if (paused || !host_has_focus) Mix_PauseMusic();
+	}
+	if (host_practice_return_state) SDL_free(host_practice_return_state);
+	if (host_practice_room_state) SDL_free(host_practice_room_state);
+	host_practice_return_state = NULL;
+	host_practice_room_state = NULL;
+	HostSetPracticeMode(0);
+	OSDset("practice ended");
+}
+
+static void HostRetryPractice(void) {
+	if (!host_practice_mode || !host_practice_room_state) return;
+	Celeste_P8_load_state(host_practice_room_state);
+	Mix_HaltChannel(-1);
+	Mix_HaltMusic();
+	current_music = NULL;
+	HostSetPracticeMode(1);
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	DesktopRecordStartPractice(host_practice_category, host_practice_room, 0);
+#endif
+	OSDset("room restarted");
+}
+
+static _Bool HostStartPractice(int category, int room) {
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	if (TAS || host_practice_mode || !initial_game_state
+	 || category < 0 || category > 1 || room < 0 || room >= 31) return 0;
+	size_t state_size = Celeste_P8_get_state_size();
+	void* return_state = SDL_malloc(state_size);
+	void* room_state = SDL_malloc(state_size);
+	if (!return_state || !room_state) {
+		if (return_state) SDL_free(return_state);
+		if (room_state) SDL_free(room_state);
+		OSDset("practice unavailable");
+		return 0;
+	}
+	HostSaveProgress();
+	Celeste_P8_save_state(return_state);
+	host_practice_return_state = return_state;
+	host_practice_room_state = room_state;
+	host_practice_return_music = current_music;
+	HostSetPracticeMode(1);
+	Celeste_P8_load_state(initial_game_state);
+	Celeste_P8_set_rndseed(8);
+	buttons_state = 0;
+	Mix_HaltChannel(-1);
+	Mix_HaltMusic();
+	current_music = NULL;
+	Celeste_P8_init();
+	Celeste_P8__DEBUG();
+	Celeste_P8_Telemetry telemetry;
+	for (int i = 0; i < 64; i++) {
+		Celeste_P8_get_telemetry(&telemetry);
+		if (!telemetry.is_title) break;
+		Celeste_P8_update();
+	}
+	Celeste_P8_get_telemetry(&telemetry);
+	if (telemetry.is_title || telemetry.room != 0) {
+		HostEndPractice();
+		OSDset("practice unavailable");
+		return 0;
+	}
+	for (int i = 0; i < room; i++) Celeste_P8__DEBUG();
+	Celeste_P8_get_telemetry(&telemetry);
+	if (telemetry.room != room) {
+		HostEndPractice();
+		OSDset("practice unavailable");
+		return 0;
+	}
+	Celeste_P8_save_state(room_state);
+	host_practice_category = category;
+	host_practice_room = room;
+	HostSetPracticeMode(1);
+	HostSetMenu(HOST_MENU_NONE);
+	Mix_PauseMusic();
+	if (!DesktopRecordStartPractice(category, room, 1)) OSDset("record video unavailable");
+	else if (room == 30) OSDset("practice summit");
+	else OSDset("practice %dm", (room + 1) * 100);
+	return 1;
+#else
+	(void)category;
+	(void)room;
+	return 0;
+#endif
+}
+
 static void HostResetRun(void) {
+	if (host_practice_mode) {
+		HostRetryPractice();
+		return;
+	}
 	if (!initial_game_state) return;
 	Celeste_P8_load_state(initial_game_state);
 	Celeste_P8_set_rndseed((unsigned)(time(NULL) + SDL_GetTicks()));
@@ -421,6 +562,7 @@ static void HostResetRun(void) {
 	current_music = NULL;
 	Celeste_P8_init();
 	host_run_millis = 0;
+	host_run_timer_remainder = 0;
 	host_run_finished = 0;
 	memset(&host_run_stats, 0, sizeof host_run_stats);
 	Celeste_P8_get_telemetry(&host_previous_telemetry);
@@ -438,11 +580,67 @@ static void HostActivateMenuSelection(void) {
 		HostSetMenu(HOST_MENU_MAIN);
 		return;
 	}
+	if (host_menu == HOST_MENU_RECORD_CATEGORIES) {
+		if (host_menu_selection == 2) HostSetMenu(HOST_MENU_MAIN);
+		else {
+			host_practice_category = host_menu_selection;
+			host_practice_room = 0;
+			HostSetMenu(HOST_MENU_RECORD_ROOMS);
+		}
+		return;
+	}
+	if (host_menu == HOST_MENU_RECORD_ROOMS) {
+		HostStartPractice(host_practice_category, host_practice_room);
+		return;
+	}
+	if (host_menu == HOST_MENU_PRACTICE) {
+		switch (host_menu_selection) {
+			case 0: HostSetMenu(HOST_MENU_NONE); break;
+			case 1: HostRetryPractice(); HostSetMenu(HOST_MENU_NONE); break;
+			case 2:
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+				if (!DesktopRecordWatch(host_practice_category)) OSDset("record unavailable");
+#endif
+				break;
+			case 3: HostEndPractice(); HostSetMenu(HOST_MENU_MAIN); host_menu_selection = 0; break;
+		}
+		return;
+	}
 	switch (host_menu_selection) {
 		case 0: HostSetMenu(HOST_MENU_NONE); break;
 		case 1: host_menu = HOST_MENU_STATS; break;
-		case 2: HostResetRun(); break;
-		case 3: HostSaveProgress(); running = 0; break;
+		case 2: host_menu_selection = 0; HostSetMenu(HOST_MENU_RECORD_CATEGORIES); break;
+		case 3: HostResetRun(); break;
+		case 4: HostSaveProgress(); running = 0; break;
+	}
+}
+
+static void HostMoveMenu(int direction) {
+	int count = 0;
+	switch (host_menu) {
+		case HOST_MENU_MAIN: count = 5; break;
+		case HOST_MENU_RECORD_CATEGORIES: count = 3; break;
+		case HOST_MENU_RECORD_ROOMS:
+			host_practice_room = (host_practice_room + direction + 31) % 31;
+			return;
+		case HOST_MENU_PRACTICE: count = 4; break;
+		default: return;
+	}
+	host_menu_selection = (host_menu_selection + direction + count) % count;
+}
+
+static void HostBackMenu(void) {
+	switch (host_menu) {
+		case HOST_MENU_STATS:
+		case HOST_MENU_RECORD_CATEGORIES:
+			HostSetMenu(HOST_MENU_MAIN);
+			host_menu_selection = 0;
+			break;
+		case HOST_MENU_RECORD_ROOMS:
+			HostSetMenu(HOST_MENU_RECORD_CATEGORIES);
+			host_menu_selection = host_practice_category;
+			break;
+		default: HostSetMenu(HOST_MENU_NONE); break;
 	}
 }
 
@@ -469,8 +667,10 @@ static void HostInitPersistence(void) {
 	if (!file) return;
 	HostSaveHeaderV2 header_v2;
 	HostSaveHeaderV3 header_v3;
+	HostSaveHeaderV4 header_v4;
 	memset(&header_v2, 0, sizeof header_v2);
 	memset(&header_v3, 0, sizeof header_v3);
+	memset(&header_v4, 0, sizeof header_v4);
 	_Bool valid = fread(&header_v2, sizeof header_v2, 1, file) == 1;
 	_Bool migrate_v2 = valid
 		&& memcmp(header_v2.magic, HOST_SAVE_V2_MAGIC, 8) == 0
@@ -478,31 +678,45 @@ static void HostInitPersistence(void) {
 	_Bool load_v3 = valid
 		&& memcmp(header_v2.magic, HOST_SAVE_V3_MAGIC, 8) == 0
 		&& header_v2.version == HOST_SAVE_V3_VERSION;
-	if (load_v3) {
+	_Bool load_v4 = valid
+		&& memcmp(header_v2.magic, HOST_SAVE_V4_MAGIC, 8) == 0
+		&& header_v2.version == HOST_SAVE_V4_VERSION;
+	if (load_v4) {
+		valid = fseek(file, 0, SEEK_SET) == 0
+			&& fread(&header_v4, sizeof header_v4, 1, file) == 1;
+	} else if (load_v3) {
 		valid = fseek(file, 0, SEEK_SET) == 0
 			&& fread(&header_v3, sizeof header_v3, 1, file) == 1;
 	} else if (!migrate_v2) {
 		valid = 0;
 	}
 	size_t state_size = Celeste_P8_get_state_size();
-	uint32_t saved_state_size = migrate_v2 ? header_v2.state_size : header_v3.state_size;
-	uint32_t run_finished = migrate_v2 ? header_v2.run_finished : header_v3.run_finished;
-	int music_index = migrate_v2 ? header_v2.music_index : header_v3.music_index;
+	uint32_t saved_state_size = migrate_v2 ? header_v2.state_size
+		: load_v3 ? header_v3.state_size : header_v4.state_size;
+	uint32_t run_finished = migrate_v2 ? header_v2.run_finished
+		: load_v3 ? header_v3.run_finished : header_v4.run_finished;
+	int music_index = migrate_v2 ? header_v2.music_index
+		: load_v3 ? header_v3.music_index : header_v4.music_index;
 	valid = valid && saved_state_size == state_size;
 	valid = valid && run_finished <= 1;
 	valid = valid && music_index >= -1 && music_index < (int)(sizeof mus / sizeof *mus);
-	valid = valid && (migrate_v2 ? HostV2StatsValid(&header_v2) : HostV3StatsValid(&header_v3));
+	valid = valid && (migrate_v2 ? HostV2StatsValid(&header_v2)
+		: load_v3 ? HostV3StatsValid(&header_v3) : HostV4StatsValid(&header_v4));
 	void* state = valid ? SDL_malloc(state_size) : NULL;
 	valid = valid && state && fread(state, state_size, 1, file) == 1;
 	valid = valid && fgetc(file) == EOF && !ferror(file);
-	uint32_t expected_checksum = migrate_v2 ? header_v2.checksum : header_v3.checksum;
+	uint32_t expected_checksum = migrate_v2 ? header_v2.checksum
+		: load_v3 ? header_v3.checksum : header_v4.checksum;
 	uint32_t checksum;
 	if (migrate_v2) {
 		header_v2.checksum = 0;
 		checksum = HostChecksum(&header_v2, sizeof header_v2, 2166136261u);
-	} else {
+	} else if (load_v3) {
 		header_v3.checksum = 0;
 		checksum = HostChecksum(&header_v3, sizeof header_v3, 2166136261u);
+	} else {
+		header_v4.checksum = 0;
+		checksum = HostChecksum(&header_v4, sizeof header_v4, 2166136261u);
 	}
 	if (valid) checksum = HostChecksum(state, state_size, checksum);
 	valid = valid && checksum == expected_checksum;
@@ -513,29 +727,43 @@ static void HostInitPersistence(void) {
 		if (state) SDL_free(state);
 		return;
 	}
-	_Bool migration_backup_ready = !migrate_v2 || DesktopPreserveBackup(
+	_Bool migrate_v3 = load_v3;
+	if (migrate_v3) {
+		snprintf(host_backup_path, sizeof host_backup_path, "%s.v3.bak", host_save_path);
+		snprintf(host_backup_tmp_path, sizeof host_backup_tmp_path, "%s.v3.bak.tmp", host_save_path);
+	}
+	_Bool migration_backup_ready = (!migrate_v2 && !migrate_v3) || DesktopPreserveBackup(
 		host_save_path, host_backup_path, host_backup_tmp_path);
 	if (!migration_backup_ready) {
 		host_save_enabled = 0;
-		ErrLog("couldn't preserve V2 backup; progress remains read-only: %s\n", host_backup_path);
+		ErrLog("couldn't preserve pre-V4 backup; progress remains read-only: %s\n", host_backup_path);
 	}
 
 	Celeste_P8_load_state(state);
 	SDL_free(state);
 	if (migrate_v2) {
-		HostSaveHeaderV3 migrated_header;
+		HostSaveHeaderV4 migrated_header;
 		Celeste_P8_get_telemetry(&host_previous_telemetry);
-		HostMigrateV2Header(
+		HostMigrateV2ToV4Header(
 			&migrated_header, &header_v2,
 			host_previous_telemetry.fruit_mask,
 			host_previous_telemetry.room);
 		host_totals = migrated_header.totals;
 		host_run_stats = migrated_header.run_stats;
+	} else if (migrate_v3) {
+		HostSaveHeaderV4 migrated_header;
+		HostMigrateV3ToV4Header(&migrated_header, &header_v3);
+		host_totals = migrated_header.totals;
+		host_run_stats = migrated_header.run_stats;
 	} else {
-		host_totals = header_v3.totals;
-		host_run_stats = header_v3.run_stats;
+		host_totals = header_v4.totals;
+		host_run_stats = header_v4.run_stats;
+		host_best_times = header_v4.best_times;
 	}
-	host_run_millis = migrate_v2 ? header_v2.run_millis : header_v3.run_millis;
+	host_run_millis = migrate_v2 ? header_v2.run_millis
+		: migrate_v3 ? header_v3.run_millis : header_v4.run_millis;
+	host_run_timer_remainder = (migrate_v2 || migrate_v3)
+		? 0 : header_v4.run_timer_remainder;
 	host_run_finished = (_Bool)run_finished;
 	Mix_HaltMusic();
 	current_music = NULL;
@@ -545,10 +773,10 @@ static void HostInitPersistence(void) {
 	}
 	Celeste_P8_get_telemetry(&host_previous_telemetry);
 	host_last_room = host_previous_telemetry.room;
-	if (migrate_v2 && migration_backup_ready) {
+	if ((migrate_v2 || migrate_v3) && migration_backup_ready) {
 		HostSaveProgress();
 		OSDset("progress upgraded");
-	} else if (migrate_v2) {
+	} else if (migrate_v2 || migrate_v3) {
 		OSDset("backup failed; save off");
 	} else {
 		OSDset("progress loaded");
@@ -557,7 +785,8 @@ static void HostInitPersistence(void) {
 }
 
 static void HostSaveProgress(void) {
-	if (TAS || !host_save_enabled || !host_telemetry_ready || !host_save_path[0]) return;
+	if (TAS || host_practice_mode || !host_save_enabled
+	 || !host_telemetry_ready || !host_save_path[0]) return;
 #if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
 	size_t state_size = Celeste_P8_get_state_size();
 	if (state_size > UINT32_MAX) return;
@@ -565,16 +794,18 @@ static void HostSaveProgress(void) {
 	if (!state) return;
 	Celeste_P8_save_state(state);
 
-	HostSaveHeaderV3 header;
+	HostSaveHeaderV4 header;
 	memset(&header, 0, sizeof header);
-	memcpy(header.magic, HOST_SAVE_V3_MAGIC, 8);
-	header.version = HOST_SAVE_V3_VERSION;
+	memcpy(header.magic, HOST_SAVE_V4_MAGIC, 8);
+	header.version = HOST_SAVE_V4_VERSION;
 	header.state_size = (uint32_t)state_size;
 	header.music_index = HostCurrentMusicIndex();
 	header.run_millis = host_run_millis;
 	header.run_finished = host_run_finished;
+	header.run_timer_remainder = host_run_timer_remainder;
 	header.run_stats = host_run_stats;
 	header.totals = host_totals;
+	header.best_times = host_best_times;
 	header.checksum = HostChecksum(&header, sizeof header, 2166136261u);
 	header.checksum = HostChecksum(state, state_size, header.checksum);
 
@@ -604,9 +835,16 @@ static void HostUpdateStats(void) {
 	Uint32 now = SDL_GetTicks();
 	Uint32 elapsed = now - host_previous_tick;
 	host_previous_tick = now;
+	if (host_practice_mode) {
+		host_previous_telemetry = telemetry;
+		host_telemetry_ready = 1;
+		host_last_room = telemetry.room;
+		return;
+	}
 	_Bool new_run = host_telemetry_ready && host_previous_telemetry.is_title && !telemetry.is_title;
 	if (new_run) {
 		host_run_millis = 0;
+		host_run_timer_remainder = 0;
 		host_run_finished = 0;
 		memset(&host_run_stats, 0, sizeof host_run_stats);
 	}
@@ -638,17 +876,26 @@ static void HostUpdateStats(void) {
 		host_totals.stages += stages;
 	}
 
-	if (!paused && host_has_focus && !telemetry.is_title) {
-		if (!host_run_finished) host_run_millis += elapsed;
+	_Bool game_frame = !paused && host_has_focus;
+	_Bool first_summit = !host_run_finished && host_telemetry_ready
+		&& HostReachedSummit(host_previous_telemetry.room, telemetry.room);
+	if (game_frame && !telemetry.is_title) {
+		if (!host_run_finished && host_telemetry_ready
+		 && HostShouldAdvanceRunTimer(
+			host_previous_telemetry.is_title, host_previous_telemetry.room))
+			HostAdvanceRunTimerFrame(&host_run_millis, &host_run_timer_remainder);
 		host_totals.ingame_millis += elapsed;
 	}
-	if (host_telemetry_ready
-	 && telemetry.completions > host_previous_telemetry.completions)
+	if (first_summit) {
+		HostRecordBestTime(&host_best_times, host_run_millis, telemetry.fruit_mask);
 		host_run_finished = 1;
+	}
 	host_previous_telemetry = telemetry;
 	host_telemetry_ready = 1;
 
-	if (!TAS && telemetry.room != host_last_room) {
+	if (!TAS && first_summit) {
+		HostSaveProgress();
+	} else if (!TAS && telemetry.room != host_last_room) {
 		host_last_room = telemetry.room;
 		HostSaveProgress();
 	} else if (!TAS && now - host_last_save_tick >= 10000u) {
@@ -664,6 +911,16 @@ static void HostDrawTimer(void) {
 	HostFormatDuration(time_text, sizeof time_text, host_run_millis, 1);
 	p8_rectfill(PICO8_W, 0, HOST_W - 1, PICO8_H - 1, 0);
 	p8_rectfill(PICO8_W, 0, PICO8_W + 1, PICO8_H - 1, 1);
+	if (host_practice_mode) {
+		char room_text[24];
+		if (host_practice_room == 30) snprintf(room_text, sizeof room_text, "summit");
+		else snprintf(room_text, sizeof room_text, "%dm", (host_practice_room + 1) * 100);
+		p8_print("practice", PICO8_W + 9, 10, 6);
+		p8_print(host_practice_category ? "all18 record" : "any% record", PICO8_W + 9, 22, 7);
+		p8_print(room_text, PICO8_W + 9, 35, 10);
+		p8_print("esc: menu", PICO8_W + 9, 110, 5);
+		return;
+	}
 	p8_print("speedrun", PICO8_W + 9, 10, 6);
 	p8_print(telemetry.is_title ? "--:--:--.--" : time_text, PICO8_W + 9, 20, 7);
 	if (!telemetry.is_title) {
@@ -684,21 +941,61 @@ static void HostDrawMenu(void) {
 	p8_rectfill(PICO8_W, 0, PICO8_W + 1, PICO8_H - 1, 1);
 
 	if (host_menu == HOST_MENU_MAIN) {
-		static const char* items[] = {"resume", "stats", "reset to start", "save and quit"};
+		static const char* items[] = {"resume", "stats", "record practice", "reset to start", "save and quit"};
 		p8_print("menu", panel_x, 10, 7);
 		for (int i = 0; i < (int)(sizeof items / sizeof *items); i++) {
 			char line[32];
 			snprintf(line, sizeof line, "%c %s", i == host_menu_selection ? '>' : ' ', items[i]);
-			p8_print(line, panel_x, 31 + i * 14, i == host_menu_selection ? 10 : 6);
+			p8_print(line, panel_x, 22 + i * 14, i == host_menu_selection ? 10 : 6);
 		}
-		if (host_menu_selection == 2) p8_print("keeps all-time stats", panel_x, 95, 5);
+		if (host_menu_selection == 3) p8_print("keeps all-time stats", panel_x, 95, 5);
 		p8_print("arrows + z/enter", panel_x, 110, 5);
 		return;
 	}
+	if (host_menu == HOST_MENU_RECORD_CATEGORIES) {
+		static const char* items[] = {"any%", "all 18 berries", "back"};
+		p8_print("record practice", panel_x, 8, 7);
+		for (int i = 0; i < 3; i++) {
+			char line[32];
+			snprintf(line, sizeof line, "%c %s", i == host_menu_selection ? '>' : ' ', items[i]);
+			p8_print(line, panel_x, 31 + i * 14, i == host_menu_selection ? 10 : 6);
+		}
+		p8_print("choose route", panel_x, 91, 5);
+		return;
+	}
+	if (host_menu == HOST_MENU_RECORD_ROOMS) {
+		char room_text[32];
+		if (host_practice_room == 30) snprintf(room_text, sizeof room_text, "summit");
+		else snprintf(room_text, sizeof room_text, "%dm", (host_practice_room + 1) * 100);
+		p8_print(host_practice_category ? "all18 rooms" : "any% rooms", panel_x, 8, 7);
+		p8_print(room_text, panel_x, 36, 10);
+		p8_print("up/down: room", panel_x, 60, 6);
+		p8_print("z: practice", panel_x, 73, 7);
+		p8_print("x: watch full", panel_x, 86, 7);
+		p8_print("esc: back", panel_x, 110, 5);
+		return;
+	}
+	if (host_menu == HOST_MENU_PRACTICE) {
+		static const char* items[] = {"resume", "retry room", "watch full", "end practice"};
+		p8_print("practice", panel_x, 10, 7);
+		for (int i = 0; i < 4; i++) {
+			char line[32];
+			snprintf(line, sizeof line, "%c %s", i == host_menu_selection ? '>' : ' ', items[i]);
+			p8_print(line, panel_x, 30 + i * 16, i == host_menu_selection ? 10 : 6);
+		}
+		p8_print("esc: resume", panel_x, 110, 5);
+		return;
+	}
 
-	char line[64], run_time[32], total_time[32];
+	char line[64], run_time[32], total_time[32], any_best[32], all_best[32];
 	HostFormatDuration(run_time, sizeof run_time, host_run_millis, 0);
 	HostFormatDuration(total_time, sizeof total_time, host_totals.ingame_millis, 0);
+	if (host_best_times.any_percent_millis)
+		HostFormatDuration(any_best, sizeof any_best, host_best_times.any_percent_millis, 1);
+	else snprintf(any_best, sizeof any_best, "--:--:--.--");
+	if (host_best_times.all_strawberries_millis)
+		HostFormatDuration(all_best, sizeof all_best, host_best_times.all_strawberries_millis, 1);
+	else snprintf(all_best, sizeof all_best, "--:--:--.--");
 	p8_print("stats", panel_x, 4, 7);
 	p8_print("current / all time", panel_x, 14, 6);
 #define DRAW_STAT(y, label, current, total) do { \
@@ -718,10 +1015,13 @@ static void HostDrawMenu(void) {
 	DRAW_STAT(79, "completions", host_run_stats.completions, host_totals.completions);
 #undef DRAW_STAT
 	snprintf(line, sizeof line, "time %s", run_time);
-	p8_print(line, panel_x, 90, 7);
+	p8_print(line, panel_x, 87, 7);
 	snprintf(line, sizeof line, "all  %s", total_time);
-	p8_print(line, panel_x, 99, 7);
-	p8_print("z/enter/esc: back", panel_x, 113, 5);
+	p8_print(line, panel_x, 96, 7);
+	snprintf(line, sizeof line, "any%% %s", any_best);
+	p8_print(line, panel_x, 105, 10);
+	snprintf(line, sizeof line, "all18 %s", all_best);
+	p8_print(line, panel_x, 114, 10);
 #endif
 }
 
@@ -821,6 +1121,9 @@ int main(int argc, char** argv) {
 
 	Celeste_P8_init();
 	HostInitPersistence();
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	DesktopRecordInit();
+#endif
 
 	printf("ready\n");
 	{
@@ -844,6 +1147,7 @@ int main(int argc, char** argv) {
 	return 0;
 #endif
 
+	if (host_practice_mode) HostEndPractice();
 	HostSaveProgress();
 	if (game_state) SDL_free(game_state);
 	if (initial_game_state) SDL_free(initial_game_state);
@@ -904,20 +1208,21 @@ static void mainLoop(void) {
 	if (host_menu != HOST_MENU_NONE) {
 		if (!((prev_buttons_state >> PSEUDO_BTN_PAUSE) & 1)
 		 && (buttons_state >> PSEUDO_BTN_PAUSE) & 1) {
-			if (host_menu == HOST_MENU_STATS) HostSetMenu(HOST_MENU_MAIN);
-			else HostSetMenu(HOST_MENU_NONE);
+			HostBackMenu();
 		}
-		if (host_menu == HOST_MENU_MAIN
-		 && !((prev_buttons_state >> 2) & 1) && ((buttons_state >> 2) & 1))
-			host_menu_selection = (host_menu_selection + 3) % 4;
-		if (host_menu == HOST_MENU_MAIN
-		 && !((prev_buttons_state >> 3) & 1) && ((buttons_state >> 3) & 1))
-			host_menu_selection = (host_menu_selection + 1) % 4;
+		if (!((prev_buttons_state >> 2) & 1) && ((buttons_state >> 2) & 1))
+			HostMoveMenu(-1);
+		if (!((prev_buttons_state >> 3) & 1) && ((buttons_state >> 3) & 1))
+			HostMoveMenu(1);
 		if (!((prev_buttons_state >> 4) & 1) && ((buttons_state >> 4) & 1))
 			HostActivateMenuSelection();
-		if (host_menu == HOST_MENU_STATS
-		 && !((prev_buttons_state >> 5) & 1) && ((buttons_state >> 5) & 1))
-			HostSetMenu(HOST_MENU_MAIN);
+		if (!((prev_buttons_state >> 5) & 1) && ((buttons_state >> 5) & 1)) {
+			if (host_menu == HOST_MENU_RECORD_ROOMS) {
+#if !defined(_3DS) && !defined(EMSCRIPTEN)
+				if (!DesktopRecordWatch(host_practice_category)) OSDset("record unavailable");
+#endif
+			} else HostBackMenu();
+		}
 	} else if (!((prev_buttons_state >> PSEUDO_BTN_PAUSE) & 1)
 	 && (buttons_state >> PSEUDO_BTN_PAUSE) & 1) {
 		goto toggle_pause;
@@ -929,13 +1234,13 @@ static void mainLoop(void) {
 		goto press_exit;
 	}
 
-	if (host_menu == HOST_MENU_NONE
+	if (host_menu == HOST_MENU_NONE && !host_practice_mode
 	 && !((prev_buttons_state >> PSEUDO_BTN_SAVE_STATE) & 1)
 	 && (buttons_state >> PSEUDO_BTN_SAVE_STATE) & 1) {
 		goto save_state;
 	}
 
-	if (host_menu == HOST_MENU_NONE
+	if (host_menu == HOST_MENU_NONE && !host_practice_mode
 	 && !((prev_buttons_state >> PSEUDO_BTN_LOAD_STATE) & 1)
 	 && (buttons_state >> PSEUDO_BTN_LOAD_STATE) & 1) {
 		goto load_state;
@@ -957,7 +1262,7 @@ static void mainLoop(void) {
 				host_previous_tick = SDL_GetTicks();
 				if (!paused) {
 					Mix_Resume(-1);
-					Mix_ResumeMusic();
+					if (!host_practice_mode) Mix_ResumeMusic();
 				}
 			}
 			break;
@@ -971,7 +1276,7 @@ static void mainLoop(void) {
 				} else if (!paused) {
 					host_previous_tick = SDL_GetTicks();
 					Mix_Resume(-1);
-					Mix_ResumeMusic();
+					if (!host_practice_mode) Mix_ResumeMusic();
 				}
 			}
 			break;
@@ -982,12 +1287,15 @@ static void mainLoop(void) {
 #endif
 			if (host_menu != HOST_MENU_NONE) {
 				if (ev.key.keysym.sym == SDLK_ESCAPE) {
-					if (host_menu == HOST_MENU_STATS) HostSetMenu(HOST_MENU_MAIN);
-					else HostSetMenu(HOST_MENU_NONE);
-				} else if (host_menu == HOST_MENU_MAIN && ev.key.keysym.sym == SDLK_UP) {
-					host_menu_selection = (host_menu_selection + 3) % 4;
-				} else if (host_menu == HOST_MENU_MAIN && ev.key.keysym.sym == SDLK_DOWN) {
-					host_menu_selection = (host_menu_selection + 1) % 4;
+					HostBackMenu();
+				} else if (ev.key.keysym.sym == SDLK_UP) {
+					HostMoveMenu(-1);
+				} else if (ev.key.keysym.sym == SDLK_DOWN) {
+					HostMoveMenu(1);
+				} else if (host_menu == HOST_MENU_RECORD_ROOMS && ev.key.keysym.sym == SDLK_x) {
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+					if (!DesktopRecordWatch(host_practice_category)) OSDset("record unavailable");
+#endif
 				} else if (ev.key.keysym.sym == SDLK_z
 #if SDL_MAJOR_VERSION >= 2
 					|| ev.key.keysym.sym == SDL_SCANCODE_RETURN
@@ -1002,7 +1310,8 @@ static void mainLoop(void) {
 			if (ev.key.keysym.sym == SDLK_ESCAPE) { //do pause
 				toggle_pause:
 			#if HOST_PANEL_W > 0
-				HostSetMenu(HOST_MENU_MAIN);
+				HostSetMenu(host_practice_mode ? HOST_MENU_PRACTICE : HOST_MENU_MAIN);
+				host_menu_selection = 0;
 			#else
 				if (paused) Mix_Resume(-1), Mix_ResumeMusic(); else Mix_Pause(-1), Mix_PauseMusic();
 				paused = !paused;
@@ -1023,6 +1332,7 @@ static void mainLoop(void) {
 				break;
 			} else if (ev.key.keysym.sym == SDLK_s && kbstate[SDLK_LSHIFT]) { //save state
 				save_state:
+				if (host_practice_mode) break;
 				game_state = game_state ? game_state : SDL_malloc(Celeste_P8_get_state_size());
 				if (game_state) {
 					OSDset("save state");
@@ -1030,17 +1340,20 @@ static void mainLoop(void) {
 					game_state_music = current_music;
 					game_state_run_stats = host_run_stats;
 					game_state_run_millis = host_run_millis;
+					game_state_run_timer_remainder = host_run_timer_remainder;
 					game_state_run_finished = host_run_finished;
 				}
 				break;
 			} else if (ev.key.keysym.sym == SDLK_d && kbstate[SDLK_LSHIFT]) { //load state
 				load_state:
+				if (host_practice_mode) break;
 				if (game_state) {
 					OSDset("load state");
 					if (paused) paused = 0, Mix_Resume(-1), Mix_ResumeMusic();
 					Celeste_P8_load_state(game_state);
 					host_run_stats = game_state_run_stats;
 					host_run_millis = game_state_run_millis;
+					host_run_timer_remainder = game_state_run_timer_remainder;
 					host_run_finished = game_state_run_finished;
 					Celeste_P8_get_telemetry(&host_previous_telemetry);
 					host_telemetry_ready = 1;
@@ -1100,6 +1413,11 @@ static void mainLoop(void) {
 	} else if (host_has_focus) {
 		Celeste_P8_update();
 		Celeste_P8_draw();
+	}
+	if (host_practice_mode) {
+		Celeste_P8_Telemetry telemetry;
+		Celeste_P8_get_telemetry(&telemetry);
+		if (telemetry.room != host_practice_room) HostRetryPractice();
 	}
 	HostUpdateStats();
 	OSDdraw();
@@ -1267,6 +1585,7 @@ int pico8emu(CELESTE_P8_CALLBACK_TYPE call, ...) {
 			int mask = INT_ARG();
 
 			(void)mask; //we do not care about this since sdl mixer keeps sounds and music separate
+			if (host_practice_mode) break;
 			
 			if (index == -1) { //stop playing
 				Mix_FadeOutMusic(fade);
