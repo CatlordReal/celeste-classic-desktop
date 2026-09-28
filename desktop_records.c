@@ -9,8 +9,8 @@
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
-#include <shellapi.h>
 #include <windows.h>
+#include <shellapi.h>
 #define ACCESS _access
 #define EXECUTABLE_ACCESS 0
 #define PATH_SEPARATOR '\\'
