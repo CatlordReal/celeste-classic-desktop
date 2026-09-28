@@ -30,7 +30,7 @@ if (Test-Path -LiteralPath $installRoot) {
         throw "Refusing to modify unknown folder: $installRoot"
     }
     if (-not $Force) {
-        throw "$product is already installed. Run Uninstall-CelesteClassic.ps1 first, or rerun with -Force to replace this known installation."
+        throw "$product is already installed. Use the uninstall command in README.md, or rerun the installer with -Force to replace this known installation."
     }
 }
 

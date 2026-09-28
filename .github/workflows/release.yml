@@ -68,7 +68,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $shortcut)) { throw 'Start menu shortcut was not created' }
           & (Join-Path $payload 'Install-CelesteClassic.cmd') -Force
           if ($LASTEXITCODE -ne 0) { throw 'Installer update failed' }
-          & (Join-Path $installed 'Uninstall-CelesteClassic.cmd')
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installed 'Uninstall-CelesteClassic.ps1')
           if ($LASTEXITCODE -ne 0) { throw 'Uninstaller failed' }
           if ((Test-Path -LiteralPath $installed) -or (Test-Path -LiteralPath $shortcut)) { throw 'Uninstall did not remove installed files and shortcut' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

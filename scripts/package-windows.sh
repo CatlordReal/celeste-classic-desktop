@@ -43,7 +43,6 @@ cp -R "$out"/. "$installer/"
 cp "$root/scripts/Install-CelesteClassic.ps1" "$installer/"
 cp "$root/scripts/Uninstall-CelesteClassic.ps1" "$installer/"
 cp "$root/scripts/Install-CelesteClassic.cmd" "$installer/"
-cp "$root/scripts/Uninstall-CelesteClassic.cmd" "$installer/"
 (
     cd "$root/dist"
     rm -f ccleste-windows-installer.zip
