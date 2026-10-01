@@ -51,14 +51,14 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
       - uses: msys2/setup-msys2@40677d36a502eb2cf0fb808cc9dec31bf6152638
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             make
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-SDL2_mixer
-            mingw-w64-x86_64-mpv
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-SDL2_mixer
+            mingw-w64-ucrt-x86_64-mpv
             zip
       - shell: msys2 {0}
         run: ./scripts/package-windows.sh
