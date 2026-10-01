@@ -9,7 +9,7 @@ player="$out/player"
 rm -rf "$out"
 mkdir -p "$out" "$player/licenses"
 
-(cd "$root/records" && sha256sum -c SHA256SUMS)
+(cd "$root/records" && tr -d '\r' < SHA256SUMS | sha256sum -c -)
 
 make -C "$root" CC=gcc OUT=ccleste-game.exe \
     LDFLAGS="$(sdl2-config --libs) -lSDL2_mixer -lm"
