@@ -11,7 +11,7 @@ $markerName = '.celeste-classic-install.json'
 $markerPath = Join-Path $installRoot $markerName
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) "$product.lnk"
 
-foreach ($requiredPath in @('ccleste.exe', 'ccleste-game.exe', 'data', 'gamecontrollerdb.txt')) {
+foreach ($requiredPath in @('ccleste.exe', 'ccleste-game.exe', 'data', 'gamecontrollerdb.txt', 'records', 'player\mpv.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot $requiredPath))) {
         throw "Installer payload is incomplete: $requiredPath is missing."
     }

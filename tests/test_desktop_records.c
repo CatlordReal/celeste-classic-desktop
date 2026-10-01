@@ -12,6 +12,25 @@ static void close_enough(double actual, double expected) {
 int main(void) {
 	char url[256];
 	char tiny[8];
+
+#ifdef _WIN32
+	_putenv_s("CCLESTE_RECORD_DIR", "");
+#else
+	unsetenv("CCLESTE_RECORD_DIR");
+#endif
+	DesktopRecordInit();
+#ifdef _WIN32
+	assert(strcmp(DesktopRecordLocalPath(DESKTOP_RECORD_ANY_PERCENT),
+		"records\\any.mp4") == 0);
+	assert(strcmp(DesktopRecordLocalPath(DESKTOP_RECORD_ALL_STRAWBERRIES),
+		"records\\all-berries.mp4") == 0);
+#else
+	assert(strcmp(DesktopRecordLocalPath(DESKTOP_RECORD_ANY_PERCENT),
+		"records/any.mp4") == 0);
+	assert(strcmp(DesktopRecordLocalPath(DESKTOP_RECORD_ALL_STRAWBERRIES),
+		"records/all-berries.mp4") == 0);
+#endif
+
 	for (int category = 0; category < 2; category++) {
 		for (int room = 0; room < DESKTOP_RECORD_ROOM_COUNT; room++) {
 			double start = DesktopRecordRoomStart(category, room);

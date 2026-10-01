@@ -30,8 +30,14 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - run: brew install sdl2 sdl2_mixer
+      - run: brew install sdl2 sdl2_mixer mpv
       - run: ./scripts/package-macos.sh
+      - name: Smoke-test bundled macOS player
+        run: |
+          app='dist/Celeste Classic.app'
+          codesign --verify --deep --strict "$app"
+          "$app/Contents/Resources/player/mpv" --no-config --vo=null --ao=null --frames=2 \
+            "$app/Contents/Resources/records/any.mp4"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: macos-${{ matrix.arch }}-release
@@ -52,6 +58,7 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-SDL2_mixer
+            mingw-w64-x86_64-mpv
             zip
       - shell: msys2 {0}
         run: ./scripts/package-windows.sh
@@ -65,6 +72,11 @@ jobs:
           $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CelesteClassic'
           $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Celeste Classic.lnk'
           if (-not (Test-Path -LiteralPath (Join-Path $installed 'ccleste.exe'))) { throw 'Game was not installed' }
+          foreach ($relative in @('player\mpv.exe', 'player\README.md', 'records\any.mp4', 'records\all-berries.mp4')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $installed $relative))) { throw "Bundled media payload is missing: $relative" }
+          }
+          & (Join-Path $installed 'player\mpv.exe') --no-config --vo=null --ao=null --frames=2 (Join-Path $installed 'records\any.mp4')
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled player smoke test failed' }
           if (-not (Test-Path -LiteralPath $shortcut)) { throw 'Start menu shortcut was not created' }
           & (Join-Path $payload 'Install-CelesteClassic.cmd') -Force
           if ($LASTEXITCODE -ne 0) { throw 'Installer update failed' }

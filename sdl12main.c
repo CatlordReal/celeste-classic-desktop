@@ -260,6 +260,7 @@ enum HostMenu {
 	HOST_MENU_NONE,
 	HOST_MENU_MAIN,
 	HOST_MENU_STATS,
+	HOST_MENU_SPLITS,
 	HOST_MENU_RECORD_CATEGORIES,
 	HOST_MENU_RECORD_ROOMS,
 	HOST_MENU_PRACTICE,
@@ -267,14 +268,30 @@ enum HostMenu {
 
 static enum HostMenu host_menu = HOST_MENU_NONE;
 static int host_menu_selection = 0;
+static int host_split_view_room = 0;
 static HostTotals host_totals;
 static HostTotals host_run_stats;
 static HostBestTimes host_best_times;
+static HostStageSplits host_stage_splits;
+static uint64_t host_run_stage_millis[HOST_STAGE_COUNT];
+static HostSplitComparison host_normal_split_comparison = {.room = -1};
+static HostSplitComparison host_practice_split_comparison = {.room = -1};
+static HostSplitComparison host_practice_last_split_comparison = {.room = -1};
+static HostCopiumTimer host_copium_timer;
 static HostTotals game_state_run_stats;
 static uint64_t host_run_millis = 0;
 static uint64_t game_state_run_millis = 0;
 static uint32_t host_run_timer_remainder = 0;
 static uint32_t game_state_run_timer_remainder = 0;
+static uint64_t host_run_stage_start_millis = 0;
+static _Bool host_run_stage_split_valid = 1;
+static uint64_t game_state_run_stage_start_millis = 0;
+static _Bool game_state_run_stage_split_valid = 1;
+static uint64_t game_state_run_stage_millis[HOST_STAGE_COUNT];
+static HostSplitComparison game_state_normal_split_comparison = {.room = -1};
+static HostCopiumTimer game_state_copium_timer;
+static uint32_t host_practice_split_remainder = 0;
+static _Bool host_practice_skip_comparison_frame = 0;
 static _Bool host_run_finished = 0;
 static _Bool game_state_run_finished = 0;
 static _Bool host_practice_mode = 0;
@@ -305,6 +322,8 @@ static void HostDrawMenu(void);
 static void HostSetMenu(enum HostMenu menu);
 static void HostActivateMenuSelection(void);
 static void HostSetPracticeMode(_Bool enabled);
+static void HostBeginPracticeComparison(int room, uint64_t baseline_millis);
+static void HostCompletePracticeComparisonFrame(void);
 static _Bool HostStartPractice(int category, int room);
 static void HostRetryPractice(void);
 static void HostEndPractice(void);
@@ -396,6 +415,23 @@ static _Bool HostV4StatsValid(const HostSaveHeaderV4* header) {
 		&& header->run_stats.strawberries <= header->totals.strawberries
 		&& header->run_stats.stages <= header->totals.stages;
 }
+
+static _Bool HostV5StatsValid(const HostSaveHeaderV5* header) {
+	return header->run_timer_remainder < 30u
+		&& header->run_stage_split_valid <= 1u
+		&& header->run_stage_start_millis <= header->run_millis
+		&& header->copium.remainder < 30u
+		&& header->copium.room_start_remainder < 30u
+		&& header->copium.room_start_millis <= header->copium.millis
+		&& header->run_millis <= header->totals.ingame_millis
+		&& header->run_stats.jumps <= header->totals.jumps
+		&& header->run_stats.dashes <= header->totals.dashes
+		&& header->run_stats.climb_pixels <= header->totals.climb_pixels
+		&& header->run_stats.deaths <= header->totals.deaths
+		&& header->run_stats.completions <= header->totals.completions
+		&& header->run_stats.strawberries <= header->totals.strawberries
+		&& header->run_stats.stages <= header->totals.stages;
+}
 #endif
 
 static void HostFormatDuration(char* output, size_t output_size, uint64_t millis, _Bool centiseconds) {
@@ -410,6 +446,14 @@ static void HostFormatDuration(char* output, size_t output_size, uint64_t millis
 		snprintf(output, output_size, "%lluh %02um %02us",
 			(unsigned long long)hours, minutes, seconds);
 	}
+}
+
+static void HostFormatDelta(char* output, size_t output_size, int64_t millis) {
+	char duration[32];
+	uint64_t magnitude = millis < 0
+		? (uint64_t)(-(millis + 1)) + 1u : (uint64_t)millis;
+	HostFormatDuration(duration, sizeof duration, magnitude, 1);
+	snprintf(output, output_size, "%c%s", millis < 0 ? '-' : '+', duration);
 }
 
 static void HostFormatCount(char* output, size_t output_size, uint64_t value) {
@@ -452,6 +496,18 @@ static void HostSetPracticeMode(_Bool enabled) {
 	host_previous_tick = SDL_GetTicks();
 }
 
+static void HostBeginPracticeComparison(int room, uint64_t baseline_millis) {
+	HostSetSplitComparison(&host_practice_split_comparison, room, 0, baseline_millis);
+	host_practice_split_remainder = 0;
+	host_practice_skip_comparison_frame = 0;
+}
+
+static void HostCompletePracticeComparisonFrame(void) {
+	HostAdvanceSplitComparisonFrame(
+		&host_practice_split_comparison, &host_practice_split_remainder);
+	host_practice_last_split_comparison = host_practice_split_comparison;
+}
+
 static void HostEndPractice(void) {
 	if (!host_practice_mode) return;
 #if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
@@ -470,6 +526,8 @@ static void HostEndPractice(void) {
 	host_practice_return_state = NULL;
 	host_practice_room_state = NULL;
 	HostSetPracticeMode(0);
+	HostBeginPracticeComparison(-1, 0);
+	host_practice_last_split_comparison = (HostSplitComparison){.room = -1};
 	OSDset("practice ended");
 }
 
@@ -480,11 +538,37 @@ static void HostRetryPractice(void) {
 	Mix_HaltMusic();
 	current_music = NULL;
 	HostSetPracticeMode(1);
+	HostBeginPracticeComparison(
+		host_practice_room, host_practice_split_comparison.baseline_millis);
 #if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
 	DesktopRecordStartPractice(host_practice_category, host_practice_room, 0);
 #endif
 	OSDset("room restarted");
 }
+
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+enum { HOST_DOUBLE_DASH_ROOM = 21 };
+
+static _Bool HostSetPracticeDoubleDash(void* state, size_t state_size, int room) {
+	/* Room 21 contains the double-dash orb. Debug room skips do not collect it. */
+	if (room <= HOST_DOUBLE_DASH_ROOM) return 1;
+	const size_t max_djump_offset =
+		2 * sizeof(unsigned) + 2 * sizeof(int) + 2 * sizeof(int)
+		+ sizeof(Celeste_P8_bool_t) + sizeof(int)
+		+ 30 * sizeof(Celeste_P8_bool_t) + sizeof(Celeste_P8_bool_t)
+		+ sizeof(int) + 3 * sizeof(Celeste_P8_bool_t) + sizeof(int)
+		+ sizeof(Celeste_P8_bool_t) + 2 * sizeof(int) + sizeof(short)
+		+ sizeof(int);
+	if (max_djump_offset > state_size
+	 || state_size - max_djump_offset < sizeof(int)) return 0;
+	int max_djump;
+	memcpy(&max_djump, (char*)state + max_djump_offset, sizeof max_djump);
+	if (max_djump != 1 && max_djump != 2) return 0;
+	max_djump = 2;
+	memcpy((char*)state + max_djump_offset, &max_djump, sizeof max_djump);
+	return 1;
+}
+#endif
 
 static _Bool HostStartPractice(int category, int room) {
 #if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
@@ -533,8 +617,20 @@ static _Bool HostStartPractice(int category, int room) {
 		return 0;
 	}
 	Celeste_P8_save_state(room_state);
+	if (!HostSetPracticeDoubleDash(room_state, state_size, room)) {
+		HostEndPractice();
+		OSDset("practice unavailable");
+		return 0;
+	}
+	if (room > HOST_DOUBLE_DASH_ROOM) Celeste_P8_load_state(room_state);
 	host_practice_category = category;
 	host_practice_room = room;
+	double reference_seconds = DesktopRecordRoomEnd(category, room)
+		- DesktopRecordRoomStart(category, room);
+	uint64_t reference_millis = reference_seconds > 0.0
+		? (uint64_t)(reference_seconds * 1000.0 + 0.5) : 0;
+	HostBeginPracticeComparison(room, reference_millis);
+	host_practice_last_split_comparison = (HostSplitComparison){.room = -1};
 	HostSetPracticeMode(1);
 	HostSetMenu(HOST_MENU_NONE);
 	Mix_PauseMusic();
@@ -563,6 +659,11 @@ static void HostResetRun(void) {
 	Celeste_P8_init();
 	host_run_millis = 0;
 	host_run_timer_remainder = 0;
+	host_run_stage_start_millis = 0;
+	host_run_stage_split_valid = 1;
+	host_normal_split_comparison = (HostSplitComparison){.room = -1};
+	memset(host_run_stage_millis, 0, sizeof host_run_stage_millis);
+	HostResetCopiumTimer(&host_copium_timer);
 	host_run_finished = 0;
 	memset(&host_run_stats, 0, sizeof host_run_stats);
 	Celeste_P8_get_telemetry(&host_previous_telemetry);
@@ -576,7 +677,7 @@ static void HostResetRun(void) {
 
 static void HostActivateMenuSelection(void) {
 	if (host_menu == HOST_MENU_NONE) return;
-	if (host_menu == HOST_MENU_STATS) {
+	if (host_menu == HOST_MENU_STATS || host_menu == HOST_MENU_SPLITS) {
 		HostSetMenu(HOST_MENU_MAIN);
 		return;
 	}
@@ -609,19 +710,35 @@ static void HostActivateMenuSelection(void) {
 	switch (host_menu_selection) {
 		case 0: HostSetMenu(HOST_MENU_NONE); break;
 		case 1: host_menu = HOST_MENU_STATS; break;
-		case 2: host_menu_selection = 0; HostSetMenu(HOST_MENU_RECORD_CATEGORIES); break;
-		case 3: HostResetRun(); break;
-		case 4: HostSaveProgress(); running = 0; break;
+		case 2:
+			host_split_view_room = host_normal_split_comparison.room >= 0
+				? host_normal_split_comparison.room : host_previous_telemetry.room;
+			if (host_split_view_room < 0) host_split_view_room = 0;
+			if (host_split_view_room >= (int)HOST_STAGE_COUNT)
+				host_split_view_room = (int)HOST_STAGE_COUNT - 1;
+			HostSetMenu(HOST_MENU_SPLITS);
+			break;
+		case 3: host_menu_selection = 0; HostSetMenu(HOST_MENU_RECORD_CATEGORIES); break;
+		case 4: HostResetRun(); break;
+		case 5: HostSaveProgress(); running = 0; break;
 	}
 }
 
 static void HostMoveMenu(int direction) {
 	int count = 0;
 	switch (host_menu) {
-		case HOST_MENU_MAIN: count = 5; break;
+		case HOST_MENU_MAIN: count = 6; break;
+		case HOST_MENU_SPLITS:
+			host_split_view_room += direction;
+			if (host_split_view_room < 0) host_split_view_room = 0;
+			if (host_split_view_room >= (int)HOST_STAGE_COUNT)
+				host_split_view_room = (int)HOST_STAGE_COUNT - 1;
+			return;
 		case HOST_MENU_RECORD_CATEGORIES: count = 3; break;
 		case HOST_MENU_RECORD_ROOMS:
-			host_practice_room = (host_practice_room + direction + 31) % 31;
+			host_practice_room -= direction;
+			if (host_practice_room < 0) host_practice_room = 0;
+			if (host_practice_room >= 31) host_practice_room = 30;
 			return;
 		case HOST_MENU_PRACTICE: count = 4; break;
 		default: return;
@@ -632,6 +749,7 @@ static void HostMoveMenu(int direction) {
 static void HostBackMenu(void) {
 	switch (host_menu) {
 		case HOST_MENU_STATS:
+		case HOST_MENU_SPLITS:
 		case HOST_MENU_RECORD_CATEGORIES:
 			HostSetMenu(HOST_MENU_MAIN);
 			host_menu_selection = 0;
@@ -668,9 +786,11 @@ static void HostInitPersistence(void) {
 	HostSaveHeaderV2 header_v2;
 	HostSaveHeaderV3 header_v3;
 	HostSaveHeaderV4 header_v4;
+	HostSaveHeaderV5 header_v5;
 	memset(&header_v2, 0, sizeof header_v2);
 	memset(&header_v3, 0, sizeof header_v3);
 	memset(&header_v4, 0, sizeof header_v4);
+	memset(&header_v5, 0, sizeof header_v5);
 	_Bool valid = fread(&header_v2, sizeof header_v2, 1, file) == 1;
 	_Bool migrate_v2 = valid
 		&& memcmp(header_v2.magic, HOST_SAVE_V2_MAGIC, 8) == 0
@@ -681,7 +801,13 @@ static void HostInitPersistence(void) {
 	_Bool load_v4 = valid
 		&& memcmp(header_v2.magic, HOST_SAVE_V4_MAGIC, 8) == 0
 		&& header_v2.version == HOST_SAVE_V4_VERSION;
-	if (load_v4) {
+	_Bool load_v5 = valid
+		&& memcmp(header_v2.magic, HOST_SAVE_V5_MAGIC, 8) == 0
+		&& header_v2.version == HOST_SAVE_V5_VERSION;
+	if (load_v5) {
+		valid = fseek(file, 0, SEEK_SET) == 0
+			&& fread(&header_v5, sizeof header_v5, 1, file) == 1;
+	} else if (load_v4) {
 		valid = fseek(file, 0, SEEK_SET) == 0
 			&& fread(&header_v4, sizeof header_v4, 1, file) == 1;
 	} else if (load_v3) {
@@ -692,21 +818,26 @@ static void HostInitPersistence(void) {
 	}
 	size_t state_size = Celeste_P8_get_state_size();
 	uint32_t saved_state_size = migrate_v2 ? header_v2.state_size
-		: load_v3 ? header_v3.state_size : header_v4.state_size;
+		: load_v3 ? header_v3.state_size
+		: load_v4 ? header_v4.state_size : header_v5.state_size;
 	uint32_t run_finished = migrate_v2 ? header_v2.run_finished
-		: load_v3 ? header_v3.run_finished : header_v4.run_finished;
+		: load_v3 ? header_v3.run_finished
+		: load_v4 ? header_v4.run_finished : header_v5.run_finished;
 	int music_index = migrate_v2 ? header_v2.music_index
-		: load_v3 ? header_v3.music_index : header_v4.music_index;
+		: load_v3 ? header_v3.music_index
+		: load_v4 ? header_v4.music_index : header_v5.music_index;
 	valid = valid && saved_state_size == state_size;
 	valid = valid && run_finished <= 1;
 	valid = valid && music_index >= -1 && music_index < (int)(sizeof mus / sizeof *mus);
 	valid = valid && (migrate_v2 ? HostV2StatsValid(&header_v2)
-		: load_v3 ? HostV3StatsValid(&header_v3) : HostV4StatsValid(&header_v4));
+		: load_v3 ? HostV3StatsValid(&header_v3)
+		: load_v4 ? HostV4StatsValid(&header_v4) : HostV5StatsValid(&header_v5));
 	void* state = valid ? SDL_malloc(state_size) : NULL;
 	valid = valid && state && fread(state, state_size, 1, file) == 1;
 	valid = valid && fgetc(file) == EOF && !ferror(file);
 	uint32_t expected_checksum = migrate_v2 ? header_v2.checksum
-		: load_v3 ? header_v3.checksum : header_v4.checksum;
+		: load_v3 ? header_v3.checksum
+		: load_v4 ? header_v4.checksum : header_v5.checksum;
 	uint32_t checksum;
 	if (migrate_v2) {
 		header_v2.checksum = 0;
@@ -714,9 +845,12 @@ static void HostInitPersistence(void) {
 	} else if (load_v3) {
 		header_v3.checksum = 0;
 		checksum = HostChecksum(&header_v3, sizeof header_v3, 2166136261u);
-	} else {
+	} else if (load_v4) {
 		header_v4.checksum = 0;
 		checksum = HostChecksum(&header_v4, sizeof header_v4, 2166136261u);
+	} else {
+		header_v5.checksum = 0;
+		checksum = HostChecksum(&header_v5, sizeof header_v5, 2166136261u);
 	}
 	if (valid) checksum = HostChecksum(state, state_size, checksum);
 	valid = valid && checksum == expected_checksum;
@@ -728,42 +862,49 @@ static void HostInitPersistence(void) {
 		return;
 	}
 	_Bool migrate_v3 = load_v3;
+	_Bool migrate_v4 = load_v4;
 	if (migrate_v3) {
 		snprintf(host_backup_path, sizeof host_backup_path, "%s.v3.bak", host_save_path);
 		snprintf(host_backup_tmp_path, sizeof host_backup_tmp_path, "%s.v3.bak.tmp", host_save_path);
+	} else if (migrate_v4) {
+		snprintf(host_backup_path, sizeof host_backup_path, "%s.v4.bak", host_save_path);
+		snprintf(host_backup_tmp_path, sizeof host_backup_tmp_path, "%s.v4.bak.tmp", host_save_path);
 	}
-	_Bool migration_backup_ready = (!migrate_v2 && !migrate_v3) || DesktopPreserveBackup(
+	_Bool migration_backup_ready = (!migrate_v2 && !migrate_v3 && !migrate_v4)
+		|| DesktopPreserveBackup(
 		host_save_path, host_backup_path, host_backup_tmp_path);
 	if (!migration_backup_ready) {
 		host_save_enabled = 0;
-		ErrLog("couldn't preserve pre-V4 backup; progress remains read-only: %s\n", host_backup_path);
+		ErrLog("couldn't preserve pre-V5 backup; progress remains read-only: %s\n", host_backup_path);
 	}
 
 	Celeste_P8_load_state(state);
 	SDL_free(state);
+	HostSaveHeaderV5 loaded_header;
 	if (migrate_v2) {
-		HostSaveHeaderV4 migrated_header;
 		Celeste_P8_get_telemetry(&host_previous_telemetry);
-		HostMigrateV2ToV4Header(
-			&migrated_header, &header_v2,
+		HostMigrateV2ToV5Header(
+			&loaded_header, &header_v2,
 			host_previous_telemetry.fruit_mask,
 			host_previous_telemetry.room);
-		host_totals = migrated_header.totals;
-		host_run_stats = migrated_header.run_stats;
 	} else if (migrate_v3) {
-		HostSaveHeaderV4 migrated_header;
-		HostMigrateV3ToV4Header(&migrated_header, &header_v3);
-		host_totals = migrated_header.totals;
-		host_run_stats = migrated_header.run_stats;
+		HostMigrateV3ToV5Header(&loaded_header, &header_v3);
+	} else if (migrate_v4) {
+		HostMigrateV4ToV5Header(&loaded_header, &header_v4);
 	} else {
-		host_totals = header_v4.totals;
-		host_run_stats = header_v4.run_stats;
-		host_best_times = header_v4.best_times;
+		loaded_header = header_v5;
 	}
-	host_run_millis = migrate_v2 ? header_v2.run_millis
-		: migrate_v3 ? header_v3.run_millis : header_v4.run_millis;
-	host_run_timer_remainder = (migrate_v2 || migrate_v3)
-		? 0 : header_v4.run_timer_remainder;
+	host_totals = loaded_header.totals;
+	host_run_stats = loaded_header.run_stats;
+	host_best_times = loaded_header.best_times;
+	host_stage_splits = loaded_header.stage_splits;
+	memcpy(host_run_stage_millis, loaded_header.run_stage_millis,
+		sizeof host_run_stage_millis);
+	host_run_millis = loaded_header.run_millis;
+	host_run_timer_remainder = loaded_header.run_timer_remainder;
+	host_run_stage_start_millis = loaded_header.run_stage_start_millis;
+	host_run_stage_split_valid = (_Bool)loaded_header.run_stage_split_valid;
+	host_copium_timer = loaded_header.copium;
 	host_run_finished = (_Bool)run_finished;
 	Mix_HaltMusic();
 	current_music = NULL;
@@ -773,10 +914,10 @@ static void HostInitPersistence(void) {
 	}
 	Celeste_P8_get_telemetry(&host_previous_telemetry);
 	host_last_room = host_previous_telemetry.room;
-	if ((migrate_v2 || migrate_v3) && migration_backup_ready) {
+	if ((migrate_v2 || migrate_v3 || migrate_v4) && migration_backup_ready) {
 		HostSaveProgress();
 		OSDset("progress upgraded");
-	} else if (migrate_v2 || migrate_v3) {
+	} else if (migrate_v2 || migrate_v3 || migrate_v4) {
 		OSDset("backup failed; save off");
 	} else {
 		OSDset("progress loaded");
@@ -794,10 +935,10 @@ static void HostSaveProgress(void) {
 	if (!state) return;
 	Celeste_P8_save_state(state);
 
-	HostSaveHeaderV4 header;
+	HostSaveHeaderV5 header;
 	memset(&header, 0, sizeof header);
-	memcpy(header.magic, HOST_SAVE_V4_MAGIC, 8);
-	header.version = HOST_SAVE_V4_VERSION;
+	memcpy(header.magic, HOST_SAVE_V5_MAGIC, 8);
+	header.version = HOST_SAVE_V5_VERSION;
 	header.state_size = (uint32_t)state_size;
 	header.music_index = HostCurrentMusicIndex();
 	header.run_millis = host_run_millis;
@@ -806,6 +947,12 @@ static void HostSaveProgress(void) {
 	header.run_stats = host_run_stats;
 	header.totals = host_totals;
 	header.best_times = host_best_times;
+	header.run_stage_start_millis = host_run_stage_start_millis;
+	header.run_stage_split_valid = host_run_stage_split_valid;
+	header.stage_splits = host_stage_splits;
+	memcpy(header.run_stage_millis, host_run_stage_millis,
+		sizeof header.run_stage_millis);
+	header.copium = host_copium_timer;
 	header.checksum = HostChecksum(&header, sizeof header, 2166136261u);
 	header.checksum = HostChecksum(state, state_size, header.checksum);
 
@@ -835,7 +982,13 @@ static void HostUpdateStats(void) {
 	Uint32 now = SDL_GetTicks();
 	Uint32 elapsed = now - host_previous_tick;
 	host_previous_tick = now;
+	_Bool game_frame = !paused && host_has_focus;
 	if (host_practice_mode) {
+		if (game_frame && !host_practice_skip_comparison_frame
+		 && telemetry.room == host_practice_room)
+			HostAdvanceSplitComparisonFrame(
+				&host_practice_split_comparison, &host_practice_split_remainder);
+		host_practice_skip_comparison_frame = 0;
 		host_previous_telemetry = telemetry;
 		host_telemetry_ready = 1;
 		host_last_room = telemetry.room;
@@ -845,10 +998,17 @@ static void HostUpdateStats(void) {
 	if (new_run) {
 		host_run_millis = 0;
 		host_run_timer_remainder = 0;
+		host_run_stage_start_millis = 0;
+		host_run_stage_split_valid = 1;
+		host_normal_split_comparison = (HostSplitComparison){.room = -1};
+		memset(host_run_stage_millis, 0, sizeof host_run_stage_millis);
+		HostResetCopiumTimer(&host_copium_timer);
 		host_run_finished = 0;
 		memset(&host_run_stats, 0, sizeof host_run_stats);
 	}
 
+	_Bool death_event = 0;
+	_Bool completed_stage = 0;
 	if (host_telemetry_ready) {
 #define ADD_TELEMETRY_TOTAL(field) \
 		if (telemetry.field >= host_previous_telemetry.field) { \
@@ -863,6 +1023,7 @@ static void HostUpdateStats(void) {
 #undef ADD_TELEMETRY_TOTAL
 		if (telemetry.deaths >= host_previous_telemetry.deaths) {
 			uint64_t delta = (uint64_t)(telemetry.deaths - host_previous_telemetry.deaths);
+			death_event = delta != 0;
 			host_run_stats.deaths += delta;
 			host_totals.deaths += delta;
 		}
@@ -872,19 +1033,34 @@ static void HostUpdateStats(void) {
 		host_totals.strawberries += strawberries;
 		uint64_t stages = HostCompletedStage(
 			host_previous_telemetry.room, telemetry.room);
+		completed_stage = stages != 0;
 		host_run_stats.stages += stages;
 		host_totals.stages += stages;
 	}
 
-	_Bool game_frame = !paused && host_has_focus;
 	_Bool first_summit = !host_run_finished && host_telemetry_ready
 		&& HostReachedSummit(host_previous_telemetry.room, telemetry.room);
 	if (game_frame && !telemetry.is_title) {
 		if (!host_run_finished && host_telemetry_ready
 		 && HostShouldAdvanceRunTimer(
-			host_previous_telemetry.is_title, host_previous_telemetry.room))
+			host_previous_telemetry.is_title, host_previous_telemetry.room)) {
 			HostAdvanceRunTimerFrame(&host_run_millis, &host_run_timer_remainder);
+			HostAdvanceCopiumTimerFrame(&host_copium_timer);
+		}
 		host_totals.ingame_millis += elapsed;
+	}
+	if (death_event) HostDiscardCopiumRoom(&host_copium_timer);
+	if (completed_stage) {
+		int completed_room = host_previous_telemetry.room;
+		uint64_t stage_millis = host_run_millis - host_run_stage_start_millis;
+		if (host_run_stage_split_valid) {
+			host_run_stage_millis[completed_room] = stage_millis;
+			HostRecordStageSplit(&host_stage_splits, completed_room,
+				stage_millis, &host_normal_split_comparison);
+		}
+		host_run_stage_start_millis = host_run_millis;
+		host_run_stage_split_valid = 1;
+		HostStartCopiumRoom(&host_copium_timer);
 	}
 	if (first_summit) {
 		HostRecordBestTime(&host_best_times, host_run_millis, telemetry.fruit_mask);
@@ -912,24 +1088,74 @@ static void HostDrawTimer(void) {
 	p8_rectfill(PICO8_W, 0, HOST_W - 1, PICO8_H - 1, 0);
 	p8_rectfill(PICO8_W, 0, PICO8_W + 1, PICO8_H - 1, 1);
 	if (host_practice_mode) {
-		char room_text[24];
+		char room_text[24], attempt_text[32], record_text[32], delta_text[36];
 		if (host_practice_room == 30) snprintf(room_text, sizeof room_text, "summit");
 		else snprintf(room_text, sizeof room_text, "%dm", (host_practice_room + 1) * 100);
-		p8_print("practice", PICO8_W + 9, 10, 6);
-		p8_print(host_practice_category ? "all18 record" : "any% record", PICO8_W + 9, 22, 7);
-		p8_print(room_text, PICO8_W + 9, 35, 10);
-		p8_print("esc: menu", PICO8_W + 9, 110, 5);
+		HostFormatDuration(attempt_text, sizeof attempt_text,
+			host_practice_split_comparison.elapsed_millis, 1);
+		HostFormatDuration(record_text, sizeof record_text,
+			host_practice_split_comparison.baseline_millis, 1);
+		p8_print("practice split", PICO8_W + 9, 5, 6);
+		p8_print(host_practice_category ? "all18 record" : "any% record", PICO8_W + 9, 16, 7);
+		p8_print(room_text, PICO8_W + 9, 28, 10);
+		p8_print("attempt", PICO8_W + 9, 40, 6);
+		p8_print(attempt_text, PICO8_W + 9, 50, 7);
+		p8_print("record", PICO8_W + 9, 62, 6);
+		p8_print(record_text, PICO8_W + 9, 72, 7);
+		if (host_practice_split_comparison.has_baseline) {
+			HostFormatDelta(delta_text, sizeof delta_text,
+				host_practice_split_comparison.delta_millis);
+			p8_print(delta_text, PICO8_W + 9, 84,
+				host_practice_split_comparison.delta_millis <= 0 ? 11 : 8);
+		}
+		if (host_practice_last_split_comparison.room >= 0) {
+			char last_text[32], line[48];
+			HostFormatDuration(last_text, sizeof last_text,
+				host_practice_last_split_comparison.elapsed_millis, 1);
+			snprintf(line, sizeof line, "last %s", last_text);
+			p8_print(line, PICO8_W + 9, 96, 6);
+			if (host_practice_last_split_comparison.has_baseline) {
+				HostFormatDelta(delta_text, sizeof delta_text,
+					host_practice_last_split_comparison.delta_millis);
+				snprintf(line, sizeof line, "last %s", delta_text);
+				p8_print(line, PICO8_W + 9, 106,
+					host_practice_last_split_comparison.delta_millis <= 0 ? 11 : 8);
+			}
+		}
+		p8_print("esc: menu", PICO8_W + 9, 118, 5);
 		return;
 	}
-	p8_print("speedrun", PICO8_W + 9, 10, 6);
-	p8_print(telemetry.is_title ? "--:--:--.--" : time_text, PICO8_W + 9, 20, 7);
+	p8_print("speedrun", PICO8_W + 9, 4, 6);
+	p8_print(telemetry.is_title ? "--:--:--.--" : time_text, PICO8_W + 9, 15, 7);
 	if (!telemetry.is_title) {
-		char room_text[24];
-		snprintf(room_text, sizeof room_text, "stage %d", telemetry.room + 1);
-		if (host_run_finished) p8_print("finished", PICO8_W + 9, 33, 11);
-		p8_print(room_text, PICO8_W + 9, 44, 6);
+		char room_text[24], berry_text[24], copium_text[32];
+		snprintf(berry_text, sizeof berry_text, "berries %u/18",
+			HostPopcountFruit(telemetry.fruit_mask & HOST_ALL_STRAWBERRIES_MASK));
+		p8_print(berry_text, PICO8_W + 9, 29, 10);
+		if (telemetry.room == 30) snprintf(room_text, sizeof room_text, "summit");
+		else snprintf(room_text, sizeof room_text, "stage %d", telemetry.room + 1);
+		p8_print(room_text, PICO8_W + 9, 40, 6);
+		HostFormatDuration(copium_text, sizeof copium_text,
+			host_copium_timer.millis, 1);
+		p8_print("copium", PICO8_W + 9, 52, 6);
+		p8_print(copium_text, PICO8_W + 9, 62, 7);
+		if (host_normal_split_comparison.room >= 0) {
+			char split_text[32], delta_text[36];
+			snprintf(room_text, sizeof room_text, "last %dm",
+				(host_normal_split_comparison.room + 1) * 100);
+			p8_print(room_text, PICO8_W + 9, 75, 6);
+			HostFormatDuration(split_text, sizeof split_text,
+				host_normal_split_comparison.elapsed_millis, 1);
+			p8_print(split_text, PICO8_W + 9, 85, 7);
+			if (host_normal_split_comparison.has_baseline) {
+				HostFormatDelta(delta_text, sizeof delta_text,
+					host_normal_split_comparison.delta_millis);
+				p8_print(delta_text, PICO8_W + 9, 97,
+					host_normal_split_comparison.delta_millis <= 0 ? 11 : 8);
+			}
+		} else if (host_run_finished) p8_print("finished", PICO8_W + 9, 86, 11);
 	}
-	p8_print("esc: menu", PICO8_W + 9, 110, 5);
+	p8_print("esc: menu", PICO8_W + 9, 114, 5);
 #endif
 }
 
@@ -941,15 +1167,39 @@ static void HostDrawMenu(void) {
 	p8_rectfill(PICO8_W, 0, PICO8_W + 1, PICO8_H - 1, 1);
 
 	if (host_menu == HOST_MENU_MAIN) {
-		static const char* items[] = {"resume", "stats", "record practice", "reset to start", "save and quit"};
-		p8_print("menu", panel_x, 10, 7);
+		static const char* items[] = {"resume", "stats", "splits", "record practice", "reset to start", "save and quit"};
+		p8_print("menu", panel_x, 6, 7);
 		for (int i = 0; i < (int)(sizeof items / sizeof *items); i++) {
 			char line[32];
 			snprintf(line, sizeof line, "%c %s", i == host_menu_selection ? '>' : ' ', items[i]);
-			p8_print(line, panel_x, 22 + i * 14, i == host_menu_selection ? 10 : 6);
+			p8_print(line, panel_x, 19 + i * 13, i == host_menu_selection ? 10 : 6);
 		}
-		if (host_menu_selection == 3) p8_print("keeps all-time stats", panel_x, 95, 5);
+		if (host_menu_selection == 4) p8_print("keeps all-time stats", panel_x, 99, 5);
 		p8_print("arrows + z/enter", panel_x, 110, 5);
+		return;
+	}
+	if (host_menu == HOST_MENU_SPLITS) {
+		char room_text[24], run_text[32], best_text[32], delta_text[36], line[48];
+		uint64_t run = host_run_stage_millis[host_split_view_room];
+		uint64_t best = host_stage_splits.best_millis[host_split_view_room];
+		snprintf(room_text, sizeof room_text, "%dm", (host_split_view_room + 1) * 100);
+		p8_print("stage splits", panel_x, 8, 7);
+		p8_print(room_text, panel_x, 23, 10);
+		if (run) HostFormatDuration(run_text, sizeof run_text, run, 1);
+		else snprintf(run_text, sizeof run_text, "--:--:--.--");
+		if (best) HostFormatDuration(best_text, sizeof best_text, best, 1);
+		else snprintf(best_text, sizeof best_text, "--:--:--.--");
+		snprintf(line, sizeof line, "run %s", run_text);
+		p8_print(line, panel_x, 40, 7);
+		snprintf(line, sizeof line, "best %s", best_text);
+		p8_print(line, panel_x, 54, 7);
+		if (run && best) {
+			HostFormatDelta(delta_text, sizeof delta_text, HostSplitDelta(run, best));
+			snprintf(line, sizeof line, "delta %s", delta_text);
+			p8_print(line, panel_x, 68, run <= best ? 11 : 8);
+		} else p8_print("delta --", panel_x, 68, 6);
+		p8_print("up/down: stage", panel_x, 91, 5);
+		p8_print("esc: back", panel_x, 110, 5);
 		return;
 	}
 	if (host_menu == HOST_MENU_RECORD_CATEGORIES) {
@@ -969,9 +1219,10 @@ static void HostDrawMenu(void) {
 		else snprintf(room_text, sizeof room_text, "%dm", (host_practice_room + 1) * 100);
 		p8_print(host_practice_category ? "all18 rooms" : "any% rooms", panel_x, 8, 7);
 		p8_print(room_text, panel_x, 36, 10);
-		p8_print("up/down: room", panel_x, 60, 6);
-		p8_print("z: practice", panel_x, 73, 7);
-		p8_print("x: watch full", panel_x, 86, 7);
+		p8_print("up: higher", panel_x, 56, 6);
+		p8_print("down: lower", panel_x, 67, 6);
+		p8_print("z: practice", panel_x, 80, 7);
+		p8_print("x: watch full", panel_x, 93, 7);
 		p8_print("esc: back", panel_x, 110, 5);
 		return;
 	}
@@ -1341,6 +1592,12 @@ static void mainLoop(void) {
 					game_state_run_stats = host_run_stats;
 					game_state_run_millis = host_run_millis;
 					game_state_run_timer_remainder = host_run_timer_remainder;
+					game_state_run_stage_start_millis = host_run_stage_start_millis;
+					game_state_run_stage_split_valid = host_run_stage_split_valid;
+					memcpy(game_state_run_stage_millis, host_run_stage_millis,
+						sizeof game_state_run_stage_millis);
+					game_state_normal_split_comparison = host_normal_split_comparison;
+					game_state_copium_timer = host_copium_timer;
 					game_state_run_finished = host_run_finished;
 				}
 				break;
@@ -1354,6 +1611,12 @@ static void mainLoop(void) {
 					host_run_stats = game_state_run_stats;
 					host_run_millis = game_state_run_millis;
 					host_run_timer_remainder = game_state_run_timer_remainder;
+					host_run_stage_start_millis = game_state_run_stage_start_millis;
+					host_run_stage_split_valid = game_state_run_stage_split_valid;
+					memcpy(host_run_stage_millis, game_state_run_stage_millis,
+						sizeof host_run_stage_millis);
+					host_normal_split_comparison = game_state_normal_split_comparison;
+					host_copium_timer = game_state_copium_timer;
 					host_run_finished = game_state_run_finished;
 					Celeste_P8_get_telemetry(&host_previous_telemetry);
 					host_telemetry_ready = 1;
@@ -1417,7 +1680,11 @@ static void mainLoop(void) {
 	if (host_practice_mode) {
 		Celeste_P8_Telemetry telemetry;
 		Celeste_P8_get_telemetry(&telemetry);
-		if (telemetry.room != host_practice_room) HostRetryPractice();
+		if (telemetry.room != host_practice_room) {
+			HostCompletePracticeComparisonFrame();
+			HostRetryPractice();
+			host_practice_skip_comparison_frame = 1;
+		}
 	}
 	HostUpdateStats();
 	OSDdraw();

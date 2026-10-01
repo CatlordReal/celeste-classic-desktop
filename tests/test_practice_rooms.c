@@ -36,6 +36,34 @@ static void assert_room(int room, int is_title) {
 	assert(telemetry.is_title == is_title);
 }
 
+static size_t max_djump_offset(void) {
+	return 2 * sizeof(unsigned) + 2 * sizeof(int) + 2 * sizeof(int)
+		+ sizeof(Celeste_P8_bool_t) + sizeof(int)
+		+ 30 * sizeof(Celeste_P8_bool_t) + sizeof(Celeste_P8_bool_t)
+		+ sizeof(int) + 3 * sizeof(Celeste_P8_bool_t) + sizeof(int)
+		+ sizeof(Celeste_P8_bool_t) + 2 * sizeof(int) + sizeof(short)
+		+ sizeof(int);
+}
+
+static int saved_max_djump(const void* state, size_t state_size) {
+	size_t offset = max_djump_offset();
+	assert(offset <= state_size && state_size - offset >= sizeof(int));
+	int value;
+	memcpy(&value, (const char*)state + offset, sizeof value);
+	return value;
+}
+
+static int set_practice_double_dash(void* state, size_t state_size, int room) {
+	if (room <= 21) return 1;
+	size_t offset = max_djump_offset();
+	if (offset > state_size || state_size - offset < sizeof(int)) return 0;
+	int value = saved_max_djump(state, state_size);
+	if (value != 1 && value != 2) return 0;
+	value = 2;
+	memcpy((char*)state + offset, &value, sizeof value);
+	return 1;
+}
+
 static void enter_practice_room(const void* pre_practice_state, int room) {
 	Celeste_P8_load_state(pre_practice_state);
 	assert_room(31, 1);
@@ -65,6 +93,42 @@ int main(void) {
 
 	for (int room = 0; room <= 30; room++)
 		enter_practice_room(pre_practice_state, room);
+
+	/* Debug room skips bypass room 21's orb, so post-unlock practice seeds it. */
+	enter_practice_room(pre_practice_state, 21);
+	Celeste_P8_save_state(room_state);
+	assert(set_practice_double_dash(room_state, state_size, 21));
+	assert(saved_max_djump(room_state, state_size) == 1);
+	enter_practice_room(pre_practice_state, 22);
+	Celeste_P8_save_state(room_state);
+	assert(saved_max_djump(room_state, state_size) == 1);
+	assert(set_practice_double_dash(room_state, state_size, 22));
+	assert(saved_max_djump(room_state, state_size) == 2);
+	Celeste_P8_load_state(room_state);
+	Celeste_P8_save_state(restored_state);
+	assert(saved_max_djump(restored_state, state_size) == 2);
+	Celeste_P8_Telemetry before_jump = {0};
+	Celeste_P8_get_telemetry(&before_jump);
+	Celeste_P8_Telemetry after_jump = before_jump;
+	for (int frame = 0; frame < 240 && after_jump.jumps == before_jump.jumps; frame++) {
+		buttons = (frame & 1) ? 0 : 1u << 4;
+		Celeste_P8_update();
+		Celeste_P8_get_telemetry(&after_jump);
+	}
+	buttons = 0;
+	assert(after_jump.jumps == before_jump.jumps + 1);
+	Celeste_P8_Telemetry before_dashes = after_jump;
+	buttons = (1u << 2) | (1u << 5);
+	Celeste_P8_update();
+	buttons = 0;
+	for (int frame = 0; frame < 6; frame++) Celeste_P8_update();
+	buttons = (1u << 2) | (1u << 5);
+	Celeste_P8_update();
+	buttons = 0;
+	Celeste_P8_update();
+	Celeste_P8_Telemetry after_dashes = {0};
+	Celeste_P8_get_telemetry(&after_dashes);
+	assert(after_dashes.dashes == before_dashes.dashes + 2);
 
 	enter_practice_room(pre_practice_state, 17);
 	Celeste_P8_save_state(room_state);

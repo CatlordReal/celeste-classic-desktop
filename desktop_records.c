@@ -132,6 +132,11 @@ static int executable_exists(const char* executable) {
 static const char* mpv_executable(void) {
 	const char* configured = getenv("CCLESTE_MPV_PATH");
 	if (configured && *configured && executable_exists(configured)) return configured;
+#ifdef _WIN32
+	if (executable_exists("player\\mpv.exe")) return "player\\mpv.exe";
+#else
+	if (executable_exists("player/mpv")) return "player/mpv";
+#endif
 	return executable_exists("mpv") ? "mpv" : NULL;
 }
 
@@ -223,7 +228,10 @@ static int build_record_path(char* output, size_t output_size,
 	const char* directory, const char* filename) {
 	size_t length;
 	int written;
-	if (!directory || !*directory) return 0;
+	if (!directory || !*directory) {
+		if (output && output_size) output[0] = '\0';
+		return 0;
+	}
 	length = strlen(directory);
 	written = snprintf(output, output_size, "%s%s%s", directory,
 		directory[length - 1] == '/' || directory[length - 1] == '\\' ? "" :
@@ -242,6 +250,7 @@ static int build_record_path(char* output, size_t output_size,
 
 void DesktopRecordInit(void) {
 	const char* configured = getenv("CCLESTE_RECORD_DIR");
+	char preference_directory[PATH_MAX] = "";
 	record_directory[0] = '\0';
 	if (configured && *configured) {
 		int written = snprintf(record_directory, sizeof record_directory, "%s", configured);
@@ -251,21 +260,25 @@ void DesktopRecordInit(void) {
 #if SDL_MAJOR_VERSION >= 2
 		char* preference_path = SDL_GetPrefPath("celeste-classic", "celeste-classic");
 		if (preference_path) {
-			int written = snprintf(record_directory, sizeof record_directory,
+			int written = snprintf(preference_directory, sizeof preference_directory,
 				"%srecords", preference_path);
-			if (written < 0 || (size_t)written >= sizeof record_directory)
-				record_directory[0] = '\0';
+			if (written < 0 || (size_t)written >= sizeof preference_directory)
+				preference_directory[0] = '\0';
 			SDL_free(preference_path);
 		}
 #endif
 	}
 	for (int category = 0; category < 2; category++) {
-		if (!record_directory[0]) {
-			record_paths[category][0] = '\0';
-			continue;
+		if (record_directory[0]) {
+			(void)build_record_path(record_paths[category], sizeof record_paths[category],
+				record_directory, records[category].filename);
+		} else {
+			(void)build_record_path(record_paths[category], sizeof record_paths[category],
+				"records", records[category].filename);
+			if (!local_record_exists(category))
+				(void)build_record_path(record_paths[category], sizeof record_paths[category],
+					preference_directory, records[category].filename);
 		}
-		(void)build_record_path(record_paths[category], sizeof record_paths[category],
-			record_directory, records[category].filename);
 	}
 }
 
@@ -304,7 +317,7 @@ void DesktopRecordStopPractice(void) {
 int DesktopRecordStartPractice(int category, int room, int allow_web_fallback) {
 	const char* mpv;
 	char start[48], loop_start[48], loop_end[48], url[256];
-	const char* arguments[12];
+	const char* arguments[13];
 	if (!valid_category(category) || room < 0 || room >= DESKTOP_RECORD_ROOM_COUNT)
 		return 0;
 	DesktopRecordStopPractice();
@@ -314,17 +327,18 @@ int DesktopRecordStartPractice(int category, int room, int allow_web_fallback) {
 		snprintf(loop_start, sizeof loop_start, "--ab-loop-a=%.6f", DesktopRecordRoomStart(category, room));
 		snprintf(loop_end, sizeof loop_end, "--ab-loop-b=%.6f", DesktopRecordRoomEnd(category, room));
 		arguments[0] = mpv;
-		arguments[1] = "--no-terminal";
-		arguments[2] = "--force-window=yes";
-		arguments[3] = "--keep-open=no";
-		arguments[4] = "--autofit=50%x100%";
-		arguments[5] = "--geometry=100%:0%";
-		arguments[6] = "--title=Celeste Classic World Record Practice";
-		arguments[7] = start;
-		arguments[8] = loop_start;
-		arguments[9] = loop_end;
-		arguments[10] = record_paths[category];
-		arguments[11] = NULL;
+		arguments[1] = "--no-config";
+		arguments[2] = "--no-terminal";
+		arguments[3] = "--force-window=yes";
+		arguments[4] = "--keep-open=no";
+		arguments[5] = "--autofit=50%x100%";
+		arguments[6] = "--geometry=100%:0%";
+		arguments[7] = "--title=Celeste Classic World Record Practice";
+		arguments[8] = start;
+		arguments[9] = loop_start;
+		arguments[10] = loop_end;
+		arguments[11] = record_paths[category];
+		arguments[12] = NULL;
 		if (launch_process(mpv, arguments, 1)) return 1;
 	}
 	if (!allow_web_fallback) return 0;
@@ -334,17 +348,18 @@ int DesktopRecordStartPractice(int category, int room, int allow_web_fallback) {
 
 int DesktopRecordWatch(int category) {
 	const char* mpv;
-	const char* arguments[8];
+	const char* arguments[9];
 	if (!valid_category(category)) return 0;
 	mpv = mpv_executable();
 	if (mpv && local_record_exists(category)) {
 		arguments[0] = mpv;
-		arguments[1] = "--no-terminal";
-		arguments[2] = "--force-window=yes";
-		arguments[3] = "--keep-open=no";
-		arguments[4] = "--title=Celeste Classic World Record";
-		arguments[5] = record_paths[category];
-		arguments[6] = NULL;
+		arguments[1] = "--no-config";
+		arguments[2] = "--no-terminal";
+		arguments[3] = "--force-window=yes";
+		arguments[4] = "--keep-open=no";
+		arguments[5] = "--title=Celeste Classic World Record";
+		arguments[6] = record_paths[category];
+		arguments[7] = NULL;
 		if (launch_process(mpv, arguments, 0)) return 1;
 	}
 	return open_url(records[category].url);

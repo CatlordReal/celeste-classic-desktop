@@ -7,10 +7,13 @@
 #define HOST_SAVE_V2_MAGIC "CCLSTSV2"
 #define HOST_SAVE_V3_MAGIC "CCLSTSV3"
 #define HOST_SAVE_V4_MAGIC "CCLSTSV4"
+#define HOST_SAVE_V5_MAGIC "CCLSTSV5"
 #define HOST_SAVE_V2_VERSION 2u
 #define HOST_SAVE_V3_VERSION 3u
 #define HOST_SAVE_V4_VERSION 4u
+#define HOST_SAVE_V5_VERSION 5u
 #define HOST_FRUIT_MASK 0x3fffffffu
+#define HOST_STAGE_COUNT 30u
 /* Rooms containing FRUIT, FLY_FRUIT, FAKE_WALL, KEY, or CHEST in tilemap.h. */
 #define HOST_ALL_STRAWBERRIES_MASK 0x3b45795du
 
@@ -38,6 +41,25 @@ typedef struct {
 	uint64_t any_percent_millis;
 	uint64_t all_strawberries_millis;
 } HostBestTimes;
+
+typedef struct {
+	uint64_t best_millis[HOST_STAGE_COUNT];
+} HostStageSplits;
+
+typedef struct {
+	int room;
+	unsigned has_baseline;
+	uint64_t elapsed_millis;
+	uint64_t baseline_millis;
+	int64_t delta_millis;
+} HostSplitComparison;
+
+typedef struct {
+	uint64_t millis;
+	uint64_t room_start_millis;
+	uint32_t remainder;
+	uint32_t room_start_remainder;
+} HostCopiumTimer;
 
 /* Frozen v1.0.1 layout. Changing this breaks V2 progress migration. */
 typedef struct {
@@ -79,6 +101,26 @@ typedef struct {
 	HostTotals totals;
 	HostBestTimes best_times;
 } HostSaveHeaderV4;
+
+typedef struct {
+	char magic[8];
+	uint32_t version;
+	uint32_t state_size;
+	uint32_t checksum;
+	int32_t music_index;
+	uint64_t run_millis;
+	uint32_t run_finished;
+	uint32_t run_timer_remainder;
+	HostTotals run_stats;
+	HostTotals totals;
+	HostBestTimes best_times;
+	uint64_t run_stage_start_millis;
+	uint32_t run_stage_split_valid;
+	uint32_t reserved;
+	HostStageSplits stage_splits;
+	uint64_t run_stage_millis[HOST_STAGE_COUNT];
+	HostCopiumTimer copium;
+} HostSaveHeaderV5;
 
 static uint32_t HostChecksum(const void* data, size_t size, uint32_t hash) {
 	const unsigned char* bytes = data;
@@ -124,6 +166,69 @@ static void HostAdvanceRunTimerFrame(uint64_t* millis, uint32_t* remainder) {
 	uint32_t thirtieths = *remainder + 1000u;
 	*millis += thirtieths / 30u;
 	*remainder = thirtieths % 30u;
+}
+
+static int64_t HostSplitDelta(uint64_t elapsed_millis, uint64_t baseline_millis) {
+	if (elapsed_millis >= baseline_millis)
+		return (int64_t)(elapsed_millis - baseline_millis);
+	return -(int64_t)(baseline_millis - elapsed_millis);
+}
+
+static void HostSetSplitComparison(
+	HostSplitComparison* comparison,
+	int room,
+	uint64_t elapsed_millis,
+	uint64_t baseline_millis
+) {
+	comparison->room = room;
+	comparison->has_baseline = baseline_millis != 0;
+	comparison->elapsed_millis = elapsed_millis;
+	comparison->baseline_millis = baseline_millis;
+	comparison->delta_millis = comparison->has_baseline
+		? HostSplitDelta(elapsed_millis, baseline_millis) : 0;
+}
+
+static void HostAdvanceSplitComparisonFrame(
+	HostSplitComparison* comparison,
+	uint32_t* remainder
+) {
+	HostAdvanceRunTimerFrame(&comparison->elapsed_millis, remainder);
+	comparison->delta_millis = comparison->has_baseline
+		? HostSplitDelta(comparison->elapsed_millis, comparison->baseline_millis) : 0;
+}
+
+static unsigned HostRecordStageSplit(
+	HostStageSplits* splits,
+	int room,
+	uint64_t elapsed_millis,
+	HostSplitComparison* comparison
+) {
+	if (room < 0 || room >= (int)HOST_STAGE_COUNT || elapsed_millis == 0) return 0;
+	uint64_t previous_best = splits->best_millis[room];
+	if (comparison)
+		HostSetSplitComparison(comparison, room, elapsed_millis, previous_best);
+	if (previous_best != 0 && previous_best <= elapsed_millis) return 0;
+	splits->best_millis[room] = elapsed_millis;
+	return 1;
+}
+
+static void HostResetCopiumTimer(HostCopiumTimer* timer) {
+	for (size_t i = 0; i < sizeof *timer; i++)
+		((unsigned char*)timer)[i] = 0;
+}
+
+static void HostAdvanceCopiumTimerFrame(HostCopiumTimer* timer) {
+	HostAdvanceRunTimerFrame(&timer->millis, &timer->remainder);
+}
+
+static void HostStartCopiumRoom(HostCopiumTimer* timer) {
+	timer->room_start_millis = timer->millis;
+	timer->room_start_remainder = timer->remainder;
+}
+
+static void HostDiscardCopiumRoom(HostCopiumTimer* timer) {
+	timer->millis = timer->room_start_millis;
+	timer->remainder = timer->room_start_remainder;
 }
 
 static unsigned HostReachedSummit(int previous_room, int current_room) {
@@ -226,6 +331,50 @@ static void HostMigrateV3ToV4Header(
 	destination->run_finished = source->run_finished;
 	destination->run_stats = source->run_stats;
 	destination->totals = source->totals;
+}
+
+static void HostMigrateV4ToV5Header(
+	HostSaveHeaderV5* destination,
+	const HostSaveHeaderV4* source
+) {
+	for (size_t i = 0; i < sizeof *destination; i++)
+		((unsigned char*)destination)[i] = 0;
+	for (size_t i = 0; i < 8; i++)
+		destination->magic[i] = HOST_SAVE_V5_MAGIC[i];
+	destination->version = HOST_SAVE_V5_VERSION;
+	destination->state_size = source->state_size;
+	destination->music_index = source->music_index;
+	destination->run_millis = source->run_millis;
+	destination->run_finished = source->run_finished;
+	destination->run_timer_remainder = source->run_timer_remainder;
+	destination->run_stats = source->run_stats;
+	destination->totals = source->totals;
+	destination->best_times = source->best_times;
+	destination->run_stage_start_millis = source->run_millis;
+	destination->copium.millis = source->run_millis;
+	destination->copium.room_start_millis = source->run_millis;
+	destination->copium.remainder = source->run_timer_remainder;
+	destination->copium.room_start_remainder = source->run_timer_remainder;
+}
+
+static void HostMigrateV3ToV5Header(
+	HostSaveHeaderV5* destination,
+	const HostSaveHeaderV3* source
+) {
+	HostSaveHeaderV4 intermediate;
+	HostMigrateV3ToV4Header(&intermediate, source);
+	HostMigrateV4ToV5Header(destination, &intermediate);
+}
+
+static void HostMigrateV2ToV5Header(
+	HostSaveHeaderV5* destination,
+	const HostSaveHeaderV2* source,
+	uint32_t fruit_mask,
+	int room
+) {
+	HostSaveHeaderV4 intermediate;
+	HostMigrateV2ToV4Header(&intermediate, source, fruit_mask, room);
+	HostMigrateV4ToV5Header(destination, &intermediate);
 }
 
 #endif
