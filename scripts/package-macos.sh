@@ -26,6 +26,7 @@ cp "$root/ccleste" "$resources/ccleste-bin"
 cp -R "$root/data" "$resources/data"
 cp "$root/gamecontrollerdb.txt" "$resources/"
 cp "$root/README.md" "$resources/"
+cp "$root/assets/celeste-classic.icns" "$resources/"
 cp -R "$root/records" "$resources/records"
 cp "$(command -v mpv)" "$player/mpv"
 cp "$root/player/README.md" "$player/README.md"
@@ -41,6 +42,7 @@ cat > "$app/Contents/Info.plist" <<'EOF'
   <key>CFBundleExecutable</key><string>ccleste</string>
   <key>CFBundleIdentifier</key><string>com.ccleste.classic</string>
   <key>CFBundleName</key><string>Celeste Classic</string>
+  <key>CFBundleIconFile</key><string>celeste-classic.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
 </dict></plist>

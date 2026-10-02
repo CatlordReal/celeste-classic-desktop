@@ -10,11 +10,14 @@ rm -rf "$out"
 mkdir -p "$out" "$player/licenses"
 
 (cd "$root/records" && tr -d '\r' < SHA256SUMS | sha256sum -c -)
+(cd "$root/assets" && windres -O coff -i celeste-classic.rc -o "$root/dist/ccleste-icon.o")
 
 make -C "$root" CC=gcc OUT=ccleste-game.exe \
-    LDFLAGS="$(sdl2-config --libs) -lSDL2_mixer -lm"
+    LDFLAGS="$(sdl2-config --libs) -lSDL2_mixer -lm $root/dist/ccleste-icon.o"
 cp "$root/ccleste-game.exe" "$out/ccleste-game.exe"
-gcc -O2 -municode "$root/scripts/launch-windows.c" -o "$out/ccleste.exe"
+gcc -O2 -municode "$root/scripts/launch-windows.c" "$root/dist/ccleste-icon.o" -o "$out/ccleste.exe"
+objdump -h "$out/ccleste.exe" | grep -q '\.rsrc'
+objdump -h "$out/ccleste-game.exe" | grep -q '\.rsrc'
 cp -R "$root/data" "$out/data"
 cp "$root/gamecontrollerdb.txt" "$out/"
 cp "$root/README.md" "$out/"

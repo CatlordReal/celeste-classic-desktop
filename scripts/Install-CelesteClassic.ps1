@@ -71,6 +71,7 @@ try {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = Join-Path $installRoot 'ccleste.exe'
+    $shortcut.IconLocation = Join-Path $installRoot 'ccleste.exe'
     $shortcut.WorkingDirectory = $installRoot
     $shortcut.Description = $product
     $shortcut.Save()

@@ -540,9 +540,6 @@ static void HostRetryPractice(void) {
 	HostSetPracticeMode(1);
 	HostBeginPracticeComparison(
 		host_practice_room, host_practice_split_comparison.baseline_millis);
-#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
-	DesktopRecordStartPractice(host_practice_category, host_practice_room, 0);
-#endif
 	OSDset("room restarted");
 }
 
@@ -1302,6 +1299,16 @@ int main(int argc, char** argv) {
 #endif
 	SDL_CHECK(screen = SDL_SetVideoMode(HOST_W*scale, PICO8_H*scale, 32, videoflag));
 	SDL_WM_SetCaption("Celeste", NULL);
+#if !defined(_3DS) && !defined(EMSCRIPTEN) && SDL_MAJOR_VERSION >= 2
+	{
+		char icon_path[4096];
+		SDL_Surface* icon = SDL_LoadBMP(GetDataPath(icon_path, sizeof icon_path, "icon.bmp"));
+		if (icon) {
+			SDL_SetWindowIcon(sdl2_window, icon);
+			SDL_FreeSurface(icon);
+		}
+	}
+#endif
 	int mixflag = MIX_INIT_OGG;
 	if (Mix_Init(mixflag) != mixflag) {
 		ErrLog("Mix_Init: %s\n", Mix_GetError());
@@ -1571,6 +1578,15 @@ static void mainLoop(void) {
 			} else if (ev.key.keysym.sym == SDLK_DELETE) { //exit
 				press_exit:
 				running = 0;
+				break;
+			} else if (ev.key.keysym.sym ==
+#if SDL_MAJOR_VERSION >= 2
+				SDL_SCANCODE_R
+#else
+				SDLK_r
+#endif
+			 && host_practice_mode) {
+				HostRetryPractice();
 				break;
 			} else if (ev.key.keysym.sym == SDLK_F11 && !(kbstate[SDLK_LSHIFT] || kbstate[SDLK_ESCAPE])) {
 				if (SDL_WM_ToggleFullScreen(screen)) { //this doesn't work on windows..
